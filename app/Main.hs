@@ -4,22 +4,39 @@
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main (main) where
 
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import Control.Applicative (Applicative (pure))
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (FromJSON, KeyValue ((.=)), ToJSON (toJSON), Value (Number, String), object, parseJSON, withObject, (.:))
+import Data.Bool (Bool, not)
+import Data.Eq ((==))
+import Data.Foldable (Foldable (null), forM_, mapM_)
+import Data.Function (const, ($), (.))
+import Data.Functor ((<$>))
+import Data.Int (Int)
 import qualified Data.Map as Map
-import Data.Text (Text)
-import Network.HTTP.Types.Status (status404)
-import Web.Scotty (ActionM, get, json, jsonData, pathParam, put, scotty, status)
+import Data.Maybe (Maybe (Just, Nothing), maybe)
+import Data.Semigroup (Semigroup ((<>)))
+import Data.Text (Text, pack, unpack)
+import qualified Data.Text.Lazy as TL
+import Network.HTTP.Types.Status (status400, status404)
+import Network.Wai.Middleware.RequestLogger (logStdoutDev)
+import System.IO (IO, putStrLn)
+import Text.Show (Show (show))
+import Web.Scotty (ActionM, finish, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
+import Prelude (Float, Num ((+), (-)), RealFrac (round), error, realToFrac)
 
 data EigerParameterValue
-  = EigerValueFloat Float
-  | EigerValueBool Bool
-  | EigerValueText Text
-  | EigerValueInt Int
+  = EigerValueFloat !Float
+  | EigerValueBool !Bool
+  | EigerValueText !Text
+  | EigerValueInt !Int
+  deriving (Show)
 
 instance ToJSON EigerParameterValue where
   toJSON (EigerValueFloat f) = toJSON f
@@ -27,7 +44,7 @@ instance ToJSON EigerParameterValue where
   toJSON (EigerValueText f) = toJSON f
   toJSON (EigerValueInt f) = toJSON f
 
-data FloatOrInt = IsFloat Float | IsInt Int
+data FloatOrInt = IsFloat !Float | IsInt !Int
 
 instance ToJSON FloatOrInt where
   toJSON (IsFloat f) = toJSON f
@@ -42,13 +59,13 @@ instance ToJSON AccessMode where
   toJSON ReadWrite = "rw"
 
 data EigerParameter = EigerParameter
-  { value :: EigerParameterValue,
-    valueType :: EigerParameterLiteralType,
-    accessMode :: AccessMode,
-    minValue :: Maybe FloatOrInt,
-    maxValue :: Maybe FloatOrInt,
-    unit :: Maybe Text,
-    allowedValues :: [Text]
+  { value :: !EigerParameterValue,
+    valueType :: !EigerParameterLiteralType,
+    accessMode :: !AccessMode,
+    minValue :: !(Maybe FloatOrInt),
+    maxValue :: !(Maybe FloatOrInt),
+    unit :: !(Maybe Text),
+    allowedValues :: ![Text]
   }
 
 instance ToJSON EigerParameter where
@@ -75,26 +92,29 @@ boolParameter value accessMode =
       allowedValues = []
     }
 
-initEigerStatusParameters :: Map.Map Text EigerParameter
-initEigerStatusParameters =
-  Map.fromList
-    [ ( "state",
-        EigerParameter
-          { value = EigerValueText "idle",
-            valueType = "string",
-            accessMode = ReadOnly,
-            minValue = Nothing,
-            maxValue = Nothing,
-            unit = Nothing,
-            allowedValues = ["na", "idle", "ready", "acquire", "confgiure", "initialize", "error"]
-          }
-      )
-    ]
+stateParameter :: Text -> EigerParameter
+stateParameter value =
+  EigerParameter
+    { value = EigerValueText value,
+      valueType = "string",
+      accessMode = ReadOnly,
+      minValue = Nothing,
+      maxValue = Nothing,
+      unit = Nothing,
+      allowedValues = ["na", "idle", "ready", "acquire", "configure", "initialize", "error"]
+    }
 
-initEigerStreamParameters :: Map.Map Text EigerParameter
-initEigerStreamParameters =
+stateVariable :: (Text, EigerParameter)
+stateVariable =
+  ( "state",
+    stateParameter "idle"
+  )
+
+initEigerStreamConfigParameters :: Map.Map Text EigerParameter
+initEigerStreamConfigParameters =
   Map.fromList
-    [ ( "mode",
+    [ stateVariable,
+      ( "mode",
         EigerParameter
           { value = EigerValueText "disabled",
             valueType = "string",
@@ -129,8 +149,16 @@ initEigerStreamParameters =
       )
     ]
 
-initEigerConfigParameters :: Map.Map Text EigerParameter
-initEigerConfigParameters =
+initEigerStreamStatusParameters :: Map.Map Text EigerParameter
+initEigerStreamStatusParameters =
+  Map.fromList [stateVariable]
+
+initEigerDetectorStatusParameters :: Map.Map Text EigerParameter
+initEigerDetectorStatusParameters =
+  Map.fromList [stateVariable]
+
+initEigerDetectorConfigParameters :: Map.Map Text EigerParameter
+initEigerDetectorConfigParameters =
   Map.fromList
     [ ( "nimages",
         EigerParameter
@@ -177,7 +205,7 @@ initEigerConfigParameters =
           { value = EigerValueFloat 0.01,
             valueType = "float",
             accessMode = ReadWrite,
-            minValue = Just (IsFloat 0.003571429),
+            minValue = Just (IsFloat 0.003_571_429),
             maxValue = Nothing,
             unit = Just "s",
             allowedValues = []
@@ -188,7 +216,7 @@ initEigerConfigParameters =
           { value = EigerValueFloat 0.005,
             valueType = "float",
             accessMode = ReadWrite,
-            minValue = Just (IsFloat 0.003571429),
+            minValue = Just (IsFloat 0.003_571_429),
             maxValue = Just (IsFloat 3600.0),
             unit = Just "s",
             allowedValues = []
@@ -196,8 +224,12 @@ initEigerConfigParameters =
       )
     ]
 
-initEigerFileWriterParameters :: Map.Map Text EigerParameter
-initEigerFileWriterParameters =
+initEigerFileWriterStatusParameters :: Map.Map Text EigerParameter
+initEigerFileWriterStatusParameters =
+  Map.fromList [stateVariable]
+
+initEigerFileWriterConfigParameters :: Map.Map Text EigerParameter
+initEigerFileWriterConfigParameters =
   Map.fromList
     [ ( "nimages_per_file",
         EigerParameter
@@ -208,6 +240,17 @@ initEigerFileWriterParameters =
             maxValue = Nothing,
             unit = Nothing,
             allowedValues = []
+          }
+      ),
+      ( "mode",
+        EigerParameter
+          { value = EigerValueText "disabled",
+            valueType = "string",
+            accessMode = ReadWrite,
+            minValue = Nothing,
+            maxValue = Nothing,
+            unit = Nothing,
+            allowedValues = ["enabled", "disabled"]
           }
       )
     ]
@@ -233,46 +276,114 @@ modifyViaRequest putRequest p =
               _ -> error "invalid request content"
        in p {value = newValue}
 
+abort400 :: Text -> ActionM ()
+abort400 message = do
+  status status400
+  json message
+  finish
+
+packShow :: (Show a) => a -> Text
+packShow = pack . show
+
+packShowLazy :: (Show a) => a -> TL.Text
+packShowLazy = TL.pack . show
+
 main :: IO ()
 main = do
-  configParams <- newMVar initEigerConfigParameters
-  streamParams <- newMVar initEigerStreamParameters
-  fileWriterParams <- newMVar initEigerFileWriterParameters
-  let mvarMap :: Map.Map Text (MVar (Map.Map Text EigerParameter))
-      mvarMap = Map.fromList [("config", configParams), ("stream", streamParams), ("filewriter", fileWriterParams)]
+  detectorStatusParams <- newMVar initEigerDetectorStatusParameters
+  detectorConfigParams <- newMVar initEigerDetectorConfigParameters
+  streamStatusParams <- newMVar initEigerStreamStatusParameters
+  streamConfigParams <- newMVar initEigerStreamConfigParameters
+  fileWriterStatusParams <- newMVar initEigerFileWriterStatusParameters
+  fileWriterConfigParams <- newMVar initEigerFileWriterConfigParameters
+  currentSeriesId :: MVar Int <- newMVar 0
+  currentTriggerId :: MVar Int <- newMVar 0
+  let mvarMap :: Map.Map (Text, Text) (MVar (Map.Map Text EigerParameter))
+      mvarMap =
+        Map.fromList
+          [ (("stream", "status"), streamStatusParams),
+            (("stream", "config"), streamConfigParams),
+            (("filewriter", "status"), fileWriterStatusParams),
+            (("filewriter", "config"), fileWriterConfigParams),
+            (("detector", "status"), detectorStatusParams),
+            (("detector", "config"), detectorConfigParams)
+          ]
+      abort :: ActionM ()
       abort = json ("lol" :: Text)
+      increaseSeriesId :: ActionM Int
+      increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
+      changeDetectorState from to = do
+        detectorParams <- liftIO $ readMVar detectorStatusParams
+        case Map.lookup "state" detectorParams of
+          Nothing -> abort400 "couldn't find state in detector params"
+          Just state ->
+            case state.value of
+              EigerValueText from' -> do
+                if from' == from
+                  then liftIO $ modifyMVar_ detectorStatusParams (pure . Map.insert "state" (stateParameter to))
+                  else abort400 $ "detector's state is not \"" <> from <> "\" but \"" <> from' <> "\""
+              _ -> abort400 "detector's state is not text"
+      arm :: ActionM ()
+      arm = do
+        newSeriesId <- increaseSeriesId
+        changeDetectorState "idle" "ready"
+        liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
+        text (packShowLazy newSeriesId)
+      trigger = do
+        configParams <- liftIO $ readMVar detectorConfigParams
+
+        case Map.lookup "nimages" configParams of
+          Nothing -> status status404
+          Just nimages' ->
+            case nimages'.value of
+              EigerValueInt nimages ->
+                forM_ [0 .. nimages - 1] \i -> do
+                  liftIO $ threadDelay 1000
+              _ -> abort400 "no images to wait for"
+      disarm = do
+        changeDetectorState "ready" "idle"
+        currentSeriesId' <- liftIO $ readMVar currentSeriesId
+        text (packShowLazy currentSeriesId')
       commands :: Map.Map Text (ActionM ())
       commands =
         Map.fromList
-          [ ("abort", abort)
+          [ ("abort", abort),
+            ("arm", arm),
+            ("trigger", trigger),
+            ("disarm", disarm)
           ]
-  scotty 3000 do
-    put "/detector/api/:version/:subsystem/:parameter" do
+  scotty 10_001 do
+    middleware logStdoutDev
+
+    get "/detector/api/:version/command/keys" do
+      json (Map.keys commands)
+    put "/detector/api/:version/command/:commandname" do
+      commandName <- pathParam "commandname"
+      case Map.lookup commandName commands of
+        Nothing -> status status404
+        Just command -> command
+    put "/:subsystem/api/:version/:configOrStatus/:parameter" do
       subsystem <- pathParam "subsystem"
-      case Map.lookup subsystem mvarMap of
+      configOrStatus <- pathParam "configOrStatus"
+      case Map.lookup (subsystem, configOrStatus) mvarMap of
         Nothing -> status status404
         Just mvar -> do
           parameter <- pathParam "parameter"
           requestContent <- jsonData
           liftIO $ modifyMVar_ mvar (pure . Map.update (Just . modifyViaRequest requestContent) parameter)
 
-    get "/detector/api/:version/command/keys" do
-      json (Map.keys commands)
-    get "/detector/api/:version/command/:commandname" do
-      commandName <- pathParam "commandname"
-      case Map.lookup commandName commands of
-        Nothing -> status status404
-        Just command -> command
-    get "/detector/api/:version/:subsystem/keys" do
+    get "/:subsystem/api/:version/:configOrStatus/keys" do
       subsystem <- pathParam "subsystem"
-      case Map.lookup subsystem mvarMap of
+      configOrStatus <- pathParam "configOrStatus"
+      case Map.lookup (subsystem, configOrStatus) mvarMap of
         Nothing -> status status404
         Just mvar -> do
           paramsResolved <- liftIO $ readMVar mvar
           json (Map.keys paramsResolved)
-    get "/detector/api/:version/:subsystem/:parameter" do
+    get "/:subsystem/api/:version/:configOrStatus/:parameter" do
       subsystem <- pathParam "subsystem"
-      case Map.lookup subsystem mvarMap of
+      configOrStatus <- pathParam "configOrStatus"
+      case Map.lookup (subsystem, configOrStatus) mvarMap of
         Nothing -> status status404
         Just mvar -> do
           parameter <- pathParam "parameter"

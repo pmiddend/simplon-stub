@@ -30,3 +30,4 @@ executable simplon-stub
     , http-types
     , aeson
     , zeromq4-haskell
+    , wai-extra
