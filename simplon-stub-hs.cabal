@@ -31,3 +31,4 @@ executable simplon-stub
     , aeson
     , zeromq4-haskell
     , wai-extra
+    , stm
