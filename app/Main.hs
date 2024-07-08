@@ -10,10 +10,10 @@
 module Main (main) where
 
 import Control.Applicative (Alternative ((<|>)), Applicative (pure, (<*>)))
-import Control.Concurrent (ThreadId, newEmptyMVar, threadDelay)
+import Control.Concurrent (ThreadId, forkIO, newEmptyMVar, threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Concurrent.STM (TVar, atomically, check, orElse, readTVarIO, registerDelay)
-import Control.Concurrent.STM.TMVar (TMVar, takeTMVar)
+import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
 import Control.Concurrent.STM.TVar (readTVar)
 import Control.Monad (forever, void, (<=<))
 import Control.Monad.IO.Class (liftIO)
@@ -36,6 +36,7 @@ import Data.Functor (Functor ((<$)), (<$>))
 import Data.Int (Int)
 import qualified Data.Map as Map
 import Data.Maybe (Maybe (Just, Nothing), maybe)
+import Data.Ord (Ord ((>)), (>=))
 import Data.Semigroup (Semigroup ((<>)))
 import Data.Text (Text, pack)
 import Data.Text.IO (putStrLn)
@@ -45,7 +46,7 @@ import Network.Wai.Middleware.RequestLogger (logStdoutDev)
 import System.IO (IO)
 import Text.Show (Show (show))
 import Web.Scotty (ActionM, finish, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
-import Prelude (Float, Num ((*), (+), (-)), RealFrac (round), error, realToFrac)
+import Prelude (Float, Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
 
 data EigerParameterValue
   = EigerValueFloat !Float
@@ -184,7 +185,7 @@ initialEigerConfig :: IO EigerConfig
 initialEigerConfig =
   EigerConfig
     <$> newMVar (EigerValueInt 10)
-    <*> newMVar (EigerValueInt 1)
+    <*> newMVar (EigerValueInt 2)
     <*> newMVar (EigerValueText "ints")
     <*> newMVar (EigerValueFloat 0.5)
     <*> newMVar (EigerValueFloat 0.5)
@@ -212,7 +213,7 @@ initEigerDetectorConfigParameters c =
       ),
       ( "ntrigger",
         EigerParameter
-          { value = c.nimages,
+          { value = c.ntrigger,
             valueType = "uint",
             accessMode = ReadWrite,
             minValue = Just (IsInt 1),
@@ -321,58 +322,79 @@ data LoopSignal = Arm | Trigger | Abort
 fini :: TVar Bool -> STM ()
 fini = check <=< readTVar
 
--- This implementation is wrong - we need to wait for triggers _and_ images (nimages vs. ntrigger)
-triggerLoop :: TMVar LoopSignal -> Int -> Float -> EigerConfig -> IO ()
-triggerLoop _ 0 _ _ = do
-  putStrLn "last trigger, quitting now"
-triggerLoop signalVar ntrigger frameTime eigerConfig = do
+overwriteMVar :: MVar a -> a -> IO ()
+overwriteMVar var value = modifyMVar_ var (const (pure value))
+
+waitForImageLoop :: TMVar LoopSignal -> Int -> Int -> Int -> Float -> EigerConfig -> IO ()
+waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig = do
+  putStrLn $ packShow nimagesLeft <> " image(s) left, waiting for this one"
   delay <- registerDelay (round (frameTime * 1000) * 1000)
   result <- atomically ((Just <$> takeTMVar signalVar) <|> (Nothing <$ fini delay))
   case result of
-    Nothing -> triggerLoop signalVar (ntrigger - 1) frameTime eigerConfig
+    Nothing ->
+      if nimagesLeft <= 1
+        then do
+          overwriteMVar eigerConfig.detectorState (EigerValueText "ready")
+          overwriteMVar eigerConfig.streamState (EigerValueText "ready")
+          if ntriggerLeft > 1
+            then do
+              putStrLn $ "no images left, but " <> packShow (ntriggerLeft - 1) <> " trigger(s)"
+              waitForTriggerLoop signalVar (ntriggerLeft - 1) nimagesTotal frameTime eigerConfig
+            else do
+              putStrLn "no images left, no triggers left"
+              overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
+              overwriteMVar eigerConfig.streamState (EigerValueText "ready")
+        else do
+          putStrLn $ packShow (nimagesLeft - 1) <> " image(s) left"
+          waitForImageLoop signalVar ntriggerLeft nimagesTotal (nimagesLeft - 1) frameTime eigerConfig
     Just Arm -> do
       putStrLn "spurious arm received, ignoring..."
-      triggerLoop signalVar ntrigger frameTime eigerConfig
-    Just Abort ->
-      putStrLn "abort received, aborting..."
+      waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
     Just Trigger -> do
-      putStrLn
-        "premature trigger, but counting anyways"
-      triggerLoop signalVar (ntrigger - 1) frameTime eigerConfig
+      putStrLn "spurious trigger received, ignoring..."
+      waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
+    Just Abort -> putStrLn "abort received"
 
-overwriteMVar var value = modifyMVar_ var (const (pure value))
+waitForTriggerLoop :: TMVar LoopSignal -> Int -> Int -> Float -> EigerConfig -> IO ()
+waitForTriggerLoop signalVar ntrigger nimages frameTime eigerConfig = do
+  putStrLn "waiting for trigger signal"
+  signal <- atomically (takeTMVar signalVar)
+  case signal of
+    Abort -> putStrLn "waited for trigger, but got abort"
+    Arm -> putStrLn "waited for trigger, but got arm - ignoring..."
+    Trigger -> do
+      putStrLn "got trigger signal, waiting for images"
+      overwriteMVar eigerConfig.detectorState (EigerValueText "acquire")
+      overwriteMVar eigerConfig.streamState (EigerValueText "acquire")
+      waitForImageLoop signalVar ntrigger nimages nimages frameTime eigerConfig
 
-armAndTriggerLoop :: TMVar LoopSignal -> EigerConfig -> IO ()
-armAndTriggerLoop signalVar eigerConfig = forever do
-  putStrLn "waiting for signal"
+-- This implementation is wrong - we need to wait for triggers _and_ images (nimages vs. ntrigger)
+-- This loop runs in parallel to the main server and initiates the triggering.
+waitForArmLoop :: TMVar LoopSignal -> EigerConfig -> IO ()
+waitForArmLoop signalVar eigerConfig = forever do
+  putStrLn "waiting for arm signal"
   signal <- atomically (takeTMVar signalVar)
   case signal of
     Abort -> putStrLn "abort, but not triggering; ignoring"
     Arm -> do
-      ntrigger <- readMVar eigerConfig.nimages
+      ntrigger <- readMVar eigerConfig.ntrigger
+      nimages <- readMVar eigerConfig.nimages
       frameTime <- readMVar eigerConfig.frameTime
 
       case ntrigger of
         EigerValueInt ntrigger' ->
           case frameTime of
-            EigerValueFloat frameTime' -> do
-              putStrLn $ "armed, waiting for " <> packShow ntrigger <> " trigger(s)"
-              triggerLoop signalVar ntrigger' frameTime' eigerConfig
-            _ -> putStrLn $ "error reading frame time"
+            EigerValueFloat frameTime' ->
+              case nimages of
+                EigerValueInt nimages' -> do
+                  overwriteMVar eigerConfig.detectorState (EigerValueText "ready")
+                  overwriteMVar eigerConfig.streamState (EigerValueText "ready")
+                  putStrLn $ "armed, waiting for " <> packShow ntrigger' <> " trigger(s), " <> packShow nimages' <> " image(s)"
+                  waitForTriggerLoop signalVar ntrigger' nimages' frameTime' eigerConfig
+                _ -> putStrLn "error reading nimages"
+            _ -> putStrLn "error reading frame time"
         _ -> putStrLn "error reading ntrigger"
-    Trigger -> do
-      putStrLn "trigger received"
-      nimages <- readMVar eigerConfig.nimages
-      ntrigger <- readMVar eigerConfig.nimages
-      frameTime <- readMVar eigerConfig.frameTime
-
-      overwriteMVar eigerConfig.detectorState (EigerValueText "acquire")
-      overwriteMVar eigerConfig.streamState (EigerValueText "acquire")
-
-      overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
-      overwriteMVar eigerConfig.streamState (EigerValueText "idle")
-
--- now wait for abort signal or thread delay
+    Trigger -> putStrLn "trigger received, ignoring"
 
 main :: IO ()
 main = do
@@ -385,7 +407,8 @@ main = do
       fileWriterConfigParams = initEigerFileWriterConfigParameters eigerConfig
   currentSeriesId :: MVar Int <- newMVar 0
   currentTriggerId :: MVar Int <- newMVar 0
-  currentTriggeringLoop :: MVar ThreadId <- newEmptyMVar
+  signalVar <- newEmptyTMVarIO
+  void $ forkIO (waitForArmLoop signalVar eigerConfig)
   let mvarMap :: Map.Map (Text, Text) MVarEigerParameterMap
       mvarMap =
         Map.fromList
@@ -412,11 +435,11 @@ main = do
       arm :: ActionM ()
       arm = do
         newSeriesId <- increaseSeriesId
-        changeDetectorState "idle" "ready"
+        -- changeDetectorState "idle" "ready"
         liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
         text (packShowLazy newSeriesId)
-      -- FIXME: needs to use signalVar to signal triggering
-      trigger = pure ()
+        liftIO $ atomically $ putTMVar signalVar Arm
+      trigger = liftIO $ atomically $ putTMVar signalVar Trigger
       disarm = do
         changeDetectorState "ready" "idle"
         currentSeriesId' <- liftIO $ readMVar currentSeriesId
@@ -430,7 +453,8 @@ main = do
             ("disarm", disarm)
           ]
   scotty 10_001 do
-    middleware logStdoutDev
+    -- Annoying normally
+    -- middleware logStdoutDev
 
     get "/detector/api/:version/command/keys" do
       json (Map.keys commands)
