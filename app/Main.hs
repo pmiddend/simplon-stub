@@ -468,5 +468,7 @@ main = do
           case Map.lookup parameter parameterMap of
             Nothing -> status status404
             Just eigerParameter' -> do
-              value <- liftIO $ readMVar eigerParameter'.value
-              json value
+              resolvedValue <- liftIO $ readMVar eigerParameter'.value
+              let resolvedParameter :: EigerParameter EigerParameterValue
+                  resolvedParameter = eigerParameter' {value = resolvedValue}
+              json resolvedParameter
