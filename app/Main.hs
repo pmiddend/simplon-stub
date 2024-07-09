@@ -353,14 +353,20 @@ waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eiger
     Just Trigger -> do
       putStrLn "spurious trigger received, ignoring..."
       waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
-    Just Abort -> putStrLn "abort received"
+    Just Abort -> do
+      putStrLn "abort received"
+      overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
+      overwriteMVar eigerConfig.streamState (EigerValueText "ready")
 
 waitForTriggerLoop :: TMVar LoopSignal -> Int -> Int -> Float -> EigerConfig -> IO ()
 waitForTriggerLoop signalVar ntrigger nimages frameTime eigerConfig = do
   putStrLn "waiting for trigger signal"
   signal <- atomically (takeTMVar signalVar)
   case signal of
-    Abort -> putStrLn "waited for trigger, but got abort"
+    Abort -> do
+      putStrLn "waited for trigger, but got abort"
+      overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
+      overwriteMVar eigerConfig.streamState (EigerValueText "ready")
     Arm -> putStrLn "waited for trigger, but got arm - ignoring..."
     Trigger -> do
       putStrLn "got trigger signal, waiting for images"
@@ -420,7 +426,7 @@ main = do
             (("detector", "config"), detectorConfigParams)
           ]
       abort :: ActionM ()
-      abort = json ("lol" :: Text)
+      abort = liftIO $ atomically $ putTMVar signalVar Abort
       increaseSeriesId :: ActionM Int
       increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
       changeDetectorState :: Text -> Text -> ActionM ()
@@ -440,10 +446,7 @@ main = do
         text (packShowLazy newSeriesId)
         liftIO $ atomically $ putTMVar signalVar Arm
       trigger = liftIO $ atomically $ putTMVar signalVar Trigger
-      disarm = do
-        changeDetectorState "ready" "idle"
-        currentSeriesId' <- liftIO $ readMVar currentSeriesId
-        text (packShowLazy currentSeriesId')
+      disarm = liftIO $ atomically $ putTMVar signalVar Abort
       commands :: Map.Map Text (ActionM ())
       commands =
         Map.fromList
