@@ -30,5 +30,7 @@ executable simplon-stub
     , http-types
     , aeson
     , zeromq4-haskell
-    , wai-extra
+    , fast-logger
+    -- for request logging
+    -- , wai-extra
     , stm

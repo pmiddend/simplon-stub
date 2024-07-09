@@ -10,9 +10,9 @@
 module Main (main) where
 
 import Control.Applicative (Alternative ((<|>)), Applicative (pure, (<*>)))
-import Control.Concurrent (ThreadId, forkIO, newEmptyMVar, threadDelay)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
-import Control.Concurrent.STM (TVar, atomically, check, orElse, readTVarIO, registerDelay)
+import Control.Concurrent.STM (TVar, atomically, check, registerDelay)
 import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
 import Control.Concurrent.STM.TVar (readTVar)
 import Control.Monad (forever, void, (<=<))
@@ -28,24 +28,22 @@ import Data.Aeson
     withObject,
     (.:),
   )
-import Data.Bool (Bool (False), not)
-import Data.Eq (Eq ((/=)), (==))
-import Data.Foldable (Foldable (null), forM_)
+import Data.Bool (Bool, not)
+import Data.Foldable (Foldable (null))
 import Data.Function (const, ($), (.))
 import Data.Functor (Functor ((<$)), (<$>))
 import Data.Int (Int)
 import qualified Data.Map as Map
 import Data.Maybe (Maybe (Just, Nothing), maybe)
-import Data.Ord (Ord ((>)), (>=))
+import Data.Ord (Ord ((>)))
 import Data.Semigroup (Semigroup ((<>)))
-import Data.Text (Text, pack)
-import Data.Text.IO (putStrLn)
+import Data.Text (Text)
 import qualified Data.Text.Lazy as TL
-import Network.HTTP.Types.Status (status400, status404)
-import Network.Wai.Middleware.RequestLogger (logStdoutDev)
+import Network.HTTP.Types.Status (status404)
 import System.IO (IO)
+import System.Log.FastLogger (LogStr, LogType' (LogStdout), ToLogStr (toLogStr), defaultBufSize, newTimeCache, withTimedFastLogger)
 import Text.Show (Show (show))
-import Web.Scotty (ActionM, finish, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
+import Web.Scotty (ActionM, get, json, jsonData, pathParam, put, scotty, status, text)
 import Prelude (Float, Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
 
 data EigerParameterValue
@@ -125,7 +123,7 @@ initEigerStreamConfigParameters c =
     [ stateVariable c.streamState,
       ( "mode",
         EigerParameter
-          { value = c.fileWriterEnabled,
+          { value = c.streamEnabled,
             valueType = "string",
             accessMode = ReadWrite,
             minValue = Nothing,
@@ -305,14 +303,8 @@ modifyViaRequest putRequest p = modifyMVar_ p.value \currentValue ->
               _ -> error "invalid request content"
        in pure newValue
 
-abort400 :: Text -> ActionM ()
-abort400 message = do
-  status status400
-  json message
-  finish
-
-packShow :: (Show a) => a -> Text
-packShow = pack . show
+packShow :: (Show a) => a -> LogStr
+packShow = toLogStr . show
 
 packShowLazy :: (Show a) => a -> TL.Text
 packShowLazy = TL.pack . show
@@ -325,9 +317,9 @@ fini = check <=< readTVar
 overwriteMVar :: MVar a -> a -> IO ()
 overwriteMVar var value = modifyMVar_ var (const (pure value))
 
-waitForImageLoop :: TMVar LoopSignal -> Int -> Int -> Int -> Float -> EigerConfig -> IO ()
-waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig = do
-  putStrLn $ packShow nimagesLeft <> " image(s) left, waiting for this one"
+waitForImageLoop :: (LogStr -> IO ()) -> TMVar LoopSignal -> Int -> Int -> Int -> Float -> EigerConfig -> IO ()
+waitForImageLoop log signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig = do
+  log $ packShow nimagesLeft <> " image(s) left, waiting for this one"
   delay <- registerDelay (round (frameTime * 1000) * 1000)
   result <- atomically ((Just <$> takeTMVar signalVar) <|> (Nothing <$ fini delay))
   case result of
@@ -338,50 +330,50 @@ waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eiger
           overwriteMVar eigerConfig.streamState (EigerValueText "ready")
           if ntriggerLeft > 1
             then do
-              putStrLn $ "no images left, but " <> packShow (ntriggerLeft - 1) <> " trigger(s)"
-              waitForTriggerLoop signalVar (ntriggerLeft - 1) nimagesTotal frameTime eigerConfig
+              log $ "no images left, but " <> packShow (ntriggerLeft - 1) <> " trigger(s)"
+              waitForTriggerLoop log signalVar (ntriggerLeft - 1) nimagesTotal frameTime eigerConfig
             else do
-              putStrLn "no images left, no triggers left"
+              log "no images left, no triggers left"
               overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
               overwriteMVar eigerConfig.streamState (EigerValueText "ready")
         else do
-          putStrLn $ packShow (nimagesLeft - 1) <> " image(s) left"
-          waitForImageLoop signalVar ntriggerLeft nimagesTotal (nimagesLeft - 1) frameTime eigerConfig
+          log $ packShow (nimagesLeft - 1) <> " image(s) left"
+          waitForImageLoop log signalVar ntriggerLeft nimagesTotal (nimagesLeft - 1) frameTime eigerConfig
     Just Arm -> do
-      putStrLn "spurious arm received, ignoring..."
-      waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
+      log "spurious arm received, ignoring..."
+      waitForImageLoop log signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
     Just Trigger -> do
-      putStrLn "spurious trigger received, ignoring..."
-      waitForImageLoop signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
+      log "spurious trigger received, ignoring..."
+      waitForImageLoop log signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
     Just Abort -> do
-      putStrLn "abort received"
+      log "abort received"
       overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
       overwriteMVar eigerConfig.streamState (EigerValueText "ready")
 
-waitForTriggerLoop :: TMVar LoopSignal -> Int -> Int -> Float -> EigerConfig -> IO ()
-waitForTriggerLoop signalVar ntrigger nimages frameTime eigerConfig = do
-  putStrLn "waiting for trigger signal"
+waitForTriggerLoop :: (LogStr -> IO ()) -> TMVar LoopSignal -> Int -> Int -> Float -> EigerConfig -> IO ()
+waitForTriggerLoop log signalVar ntrigger nimages frameTime eigerConfig = do
+  log "waiting for trigger signal"
   signal <- atomically (takeTMVar signalVar)
   case signal of
     Abort -> do
-      putStrLn "waited for trigger, but got abort"
+      log "waited for trigger, but got abort"
       overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
       overwriteMVar eigerConfig.streamState (EigerValueText "ready")
-    Arm -> putStrLn "waited for trigger, but got arm - ignoring..."
+    Arm -> log "waited for trigger, but got arm - ignoring..."
     Trigger -> do
-      putStrLn "got trigger signal, waiting for images"
+      log "got trigger signal, waiting for images"
       overwriteMVar eigerConfig.detectorState (EigerValueText "acquire")
       overwriteMVar eigerConfig.streamState (EigerValueText "acquire")
-      waitForImageLoop signalVar ntrigger nimages nimages frameTime eigerConfig
+      waitForImageLoop log signalVar ntrigger nimages nimages frameTime eigerConfig
 
 -- This implementation is wrong - we need to wait for triggers _and_ images (nimages vs. ntrigger)
 -- This loop runs in parallel to the main server and initiates the triggering.
-waitForArmLoop :: TMVar LoopSignal -> EigerConfig -> IO ()
-waitForArmLoop signalVar eigerConfig = forever do
-  putStrLn "waiting for arm signal"
+waitForArmLoop :: (LogStr -> IO ()) -> TMVar LoopSignal -> EigerConfig -> IO ()
+waitForArmLoop log signalVar eigerConfig = forever do
+  log "waiting for arm signal"
   signal <- atomically (takeTMVar signalVar)
   case signal of
-    Abort -> putStrLn "abort, but not triggering; ignoring"
+    Abort -> log "abort, but not triggering; ignoring"
     Arm -> do
       ntrigger <- readMVar eigerConfig.ntrigger
       nimages <- readMVar eigerConfig.nimages
@@ -395,107 +387,102 @@ waitForArmLoop signalVar eigerConfig = forever do
                 EigerValueInt nimages' -> do
                   overwriteMVar eigerConfig.detectorState (EigerValueText "ready")
                   overwriteMVar eigerConfig.streamState (EigerValueText "ready")
-                  putStrLn $ "armed, waiting for " <> packShow ntrigger' <> " trigger(s), " <> packShow nimages' <> " image(s)"
-                  waitForTriggerLoop signalVar ntrigger' nimages' frameTime' eigerConfig
-                _ -> putStrLn "error reading nimages"
-            _ -> putStrLn "error reading frame time"
-        _ -> putStrLn "error reading ntrigger"
-    Trigger -> putStrLn "trigger received, ignoring"
+                  log $ "armed, waiting for " <> packShow ntrigger' <> " trigger(s), " <> packShow nimages' <> " image(s)"
+                  waitForTriggerLoop log signalVar ntrigger' nimages' frameTime' eigerConfig
+                _ -> log "error reading nimages"
+            _ -> log "error reading frame time"
+        _ -> log "error reading ntrigger"
+    Trigger -> log "trigger received, ignoring"
 
 main :: IO ()
 main = do
-  eigerConfig <- initialEigerConfig
-  let detectorStatusParams = initEigerDetectorStatusParameters eigerConfig
-      detectorConfigParams = initEigerDetectorConfigParameters eigerConfig
-      streamStatusParams = initEigerStreamStatusParameters eigerConfig
-      streamConfigParams = initEigerStreamConfigParameters eigerConfig
-      fileWriterStatusParams = initEigerFileWriterStatusParameters eigerConfig
-      fileWriterConfigParams = initEigerFileWriterConfigParameters eigerConfig
-  currentSeriesId :: MVar Int <- newMVar 0
-  currentTriggerId :: MVar Int <- newMVar 0
-  signalVar <- newEmptyTMVarIO
-  void $ forkIO (waitForArmLoop signalVar eigerConfig)
-  let mvarMap :: Map.Map (Text, Text) MVarEigerParameterMap
-      mvarMap =
-        Map.fromList
-          [ (("stream", "status"), streamStatusParams),
-            (("stream", "config"), streamConfigParams),
-            (("filewriter", "status"), fileWriterStatusParams),
-            (("filewriter", "config"), fileWriterConfigParams),
-            (("detector", "status"), detectorStatusParams),
-            (("detector", "config"), detectorConfigParams)
-          ]
-      abort :: ActionM ()
-      abort = liftIO $ atomically $ putTMVar signalVar Abort
-      increaseSeriesId :: ActionM Int
-      increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
-      changeDetectorState :: Text -> Text -> ActionM ()
-      changeDetectorState from to = do
-        currentState' <- liftIO $ readMVar eigerConfig.detectorState
-        case currentState' of
-          EigerValueText currentState ->
-            if currentState /= from
-              then abort400 $ "detector's state is not \"" <> from <> "\" but \"" <> from <> "\""
-              else liftIO $ void $ modifyMVar_ eigerConfig.detectorState (\_ -> pure (EigerValueText to))
-          _ -> abort400 "detector's state is not text"
-      arm :: ActionM ()
-      arm = do
-        newSeriesId <- increaseSeriesId
-        -- changeDetectorState "idle" "ready"
-        liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
-        text (packShowLazy newSeriesId)
-        liftIO $ atomically $ putTMVar signalVar Arm
-      trigger = liftIO $ atomically $ putTMVar signalVar Trigger
-      disarm = liftIO $ atomically $ putTMVar signalVar Abort
-      commands :: Map.Map Text (ActionM ())
-      commands =
-        Map.fromList
-          [ ("abort", abort),
-            ("arm", arm),
-            ("trigger", trigger),
-            ("disarm", disarm)
-          ]
-  scotty 10_001 do
-    -- Annoying normally
-    -- middleware logStdoutDev
+  timeCache <- newTimeCache "%Y-%m-%dT%H:%M:%S%z"
+  withTimedFastLogger timeCache (LogStdout defaultBufSize) \fastLogger -> do
+    let log msg = fastLogger (\time -> toLogStr time <> " " <> msg <> "\n")
+    eigerConfig <- initialEigerConfig
+    let detectorStatusParams = initEigerDetectorStatusParameters eigerConfig
+        detectorConfigParams = initEigerDetectorConfigParameters eigerConfig
+        streamStatusParams = initEigerStreamStatusParameters eigerConfig
+        streamConfigParams = initEigerStreamConfigParameters eigerConfig
+        fileWriterStatusParams = initEigerFileWriterStatusParameters eigerConfig
+        fileWriterConfigParams = initEigerFileWriterConfigParameters eigerConfig
+    currentSeriesId :: MVar Int <- newMVar 0
+    currentTriggerId :: MVar Int <- newMVar 0
+    signalVar <- newEmptyTMVarIO
+    log "starting arm loop"
+    void $ forkIO (waitForArmLoop log signalVar eigerConfig)
+    let mvarMap :: Map.Map (Text, Text) MVarEigerParameterMap
+        mvarMap =
+          Map.fromList
+            [ (("stream", "status"), streamStatusParams),
+              (("stream", "config"), streamConfigParams),
+              (("filewriter", "status"), fileWriterStatusParams),
+              (("filewriter", "config"), fileWriterConfigParams),
+              (("detector", "status"), detectorStatusParams),
+              (("detector", "config"), detectorConfigParams)
+            ]
+        abort :: ActionM ()
+        abort = liftIO $ atomically $ putTMVar signalVar Abort
+        increaseSeriesId :: ActionM Int
+        increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
+        arm :: ActionM ()
+        arm = do
+          newSeriesId <- increaseSeriesId
+          -- changeDetectorState "idle" "ready"
+          liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
+          text (packShowLazy newSeriesId)
+          liftIO $ atomically $ putTMVar signalVar Arm
+        trigger = liftIO $ atomically $ putTMVar signalVar Trigger
+        disarm = liftIO $ atomically $ putTMVar signalVar Abort
+        commands :: Map.Map Text (ActionM ())
+        commands =
+          Map.fromList
+            [ ("abort", abort),
+              ("arm", arm),
+              ("trigger", trigger),
+              ("disarm", disarm)
+            ]
+    scotty 10_001 do
+      -- Annoying normally
+      -- middleware logStdoutDev
 
-    get "/detector/api/:version/command/keys" do
-      json (Map.keys commands)
-    put "/detector/api/:version/command/:commandname" do
-      commandName <- pathParam "commandname"
-      case Map.lookup commandName commands of
-        Nothing -> status status404
-        Just command -> command
-    put "/:subsystem/api/:version/:configOrStatus/:parameter" do
-      subsystem <- pathParam "subsystem"
-      configOrStatus <- pathParam "configOrStatus"
-      case Map.lookup (subsystem, configOrStatus) mvarMap of
-        Nothing -> status status404
-        Just parameterMap -> do
-          parameter <- pathParam "parameter"
-          requestContent <- jsonData
-          case Map.lookup parameter parameterMap of
-            Nothing -> status status404
-            Just parameterDescription ->
-              liftIO $ modifyViaRequest requestContent parameterDescription
+      get "/detector/api/:version/command/keys" do
+        json (Map.keys commands)
+      put "/detector/api/:version/command/:commandname" do
+        commandName <- pathParam "commandname"
+        case Map.lookup commandName commands of
+          Nothing -> status status404
+          Just command -> command
+      put "/:subsystem/api/:version/:configOrStatus/:parameter" do
+        subsystem <- pathParam "subsystem"
+        configOrStatus <- pathParam "configOrStatus"
+        case Map.lookup (subsystem, configOrStatus) mvarMap of
+          Nothing -> status status404
+          Just parameterMap -> do
+            parameter <- pathParam "parameter"
+            requestContent <- jsonData
+            case Map.lookup parameter parameterMap of
+              Nothing -> status status404
+              Just parameterDescription ->
+                liftIO $ modifyViaRequest requestContent parameterDescription
 
-    get "/:subsystem/api/:version/:configOrStatus/keys" do
-      subsystem <- pathParam "subsystem"
-      configOrStatus <- pathParam "configOrStatus"
-      case Map.lookup (subsystem, configOrStatus) mvarMap of
-        Nothing -> status status404
-        Just parameters -> json (Map.keys parameters)
-    get "/:subsystem/api/:version/:configOrStatus/:parameter" do
-      subsystem <- pathParam "subsystem"
-      configOrStatus <- pathParam "configOrStatus"
-      case Map.lookup (subsystem, configOrStatus) mvarMap of
-        Nothing -> status status404
-        Just parameterMap -> do
-          parameter <- pathParam "parameter"
-          case Map.lookup parameter parameterMap of
-            Nothing -> status status404
-            Just eigerParameter' -> do
-              resolvedValue <- liftIO $ readMVar eigerParameter'.value
-              let resolvedParameter :: EigerParameter EigerParameterValue
-                  resolvedParameter = eigerParameter' {value = resolvedValue}
-              json resolvedParameter
+      get "/:subsystem/api/:version/:configOrStatus/keys" do
+        subsystem <- pathParam "subsystem"
+        configOrStatus <- pathParam "configOrStatus"
+        case Map.lookup (subsystem, configOrStatus) mvarMap of
+          Nothing -> status status404
+          Just parameters -> json (Map.keys parameters)
+      get "/:subsystem/api/:version/:configOrStatus/:parameter" do
+        subsystem <- pathParam "subsystem"
+        configOrStatus <- pathParam "configOrStatus"
+        case Map.lookup (subsystem, configOrStatus) mvarMap of
+          Nothing -> status status404
+          Just parameterMap -> do
+            parameter <- pathParam "parameter"
+            case Map.lookup parameter parameterMap of
+              Nothing -> status status404
+              Just eigerParameter' -> do
+                resolvedValue <- liftIO $ readMVar eigerParameter'.value
+                let resolvedParameter :: EigerParameter EigerParameterValue
+                    resolvedParameter = eigerParameter' {value = resolvedValue}
+                json resolvedParameter
