@@ -15,7 +15,7 @@ import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar
 import Control.Concurrent.STM (TVar, atomically, check, registerDelay)
 import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
 import Control.Concurrent.STM.TVar (readTVar)
-import Control.Monad (forever, void, (<=<))
+import Control.Monad (forever, void, when, (<=<))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.STM (STM)
 import Data.Aeson
@@ -29,10 +29,12 @@ import Data.Aeson
     (.:),
   )
 import Data.Bool (Bool, not)
+import qualified Data.ByteString as BS
 import Data.Foldable (Foldable (null))
 import Data.Function (const, ($), (.))
 import Data.Functor (Functor ((<$)), (<$>))
 import Data.Int (Int)
+import Data.List ((!!))
 import qualified Data.Map as Map
 import Data.Maybe (Maybe (Just, Nothing), maybe)
 import Data.Ord (Ord ((>)))
@@ -40,10 +42,13 @@ import Data.Semigroup (Semigroup ((<>)))
 import Data.Text (Text)
 import qualified Data.Text.Lazy as TL
 import Network.HTTP.Types.Status (status404)
+import Network.Wai.Middleware.RequestLogger (logStdoutDev)
+import Simplon.Hdf5 (getDataSetDimensions, withHdf5FileAndDataSet, withImage)
+import Simplon.Options (accessLogging, inputH5DatasetPath, inputH5File, listenPort, withOptions)
 import System.IO (IO)
 import System.Log.FastLogger (LogStr, LogType' (LogStdout), ToLogStr (toLogStr), defaultBufSize, newTimeCache, withTimedFastLogger)
 import Text.Show (Show (show))
-import Web.Scotty (ActionM, get, json, jsonData, pathParam, put, scotty, status, text)
+import Web.Scotty (ActionM, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
 import Prelude (Float, Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
 
 data EigerParameterValue
@@ -397,92 +402,102 @@ waitForArmLoop log signalVar eigerConfig = forever do
 main :: IO ()
 main = do
   timeCache <- newTimeCache "%Y-%m-%dT%H:%M:%S%z"
-  withTimedFastLogger timeCache (LogStdout defaultBufSize) \fastLogger -> do
-    let log msg = fastLogger (\time -> toLogStr time <> " " <> msg <> "\n")
-    eigerConfig <- initialEigerConfig
-    let detectorStatusParams = initEigerDetectorStatusParameters eigerConfig
-        detectorConfigParams = initEigerDetectorConfigParameters eigerConfig
-        streamStatusParams = initEigerStreamStatusParameters eigerConfig
-        streamConfigParams = initEigerStreamConfigParameters eigerConfig
-        fileWriterStatusParams = initEigerFileWriterStatusParameters eigerConfig
-        fileWriterConfigParams = initEigerFileWriterConfigParameters eigerConfig
-    currentSeriesId :: MVar Int <- newMVar 0
-    currentTriggerId :: MVar Int <- newMVar 0
-    signalVar <- newEmptyTMVarIO
-    log "starting arm loop"
-    void $ forkIO (waitForArmLoop log signalVar eigerConfig)
-    let mvarMap :: Map.Map (Text, Text) MVarEigerParameterMap
-        mvarMap =
-          Map.fromList
-            [ (("stream", "status"), streamStatusParams),
-              (("stream", "config"), streamConfigParams),
-              (("filewriter", "status"), fileWriterStatusParams),
-              (("filewriter", "config"), fileWriterConfigParams),
-              (("detector", "status"), detectorStatusParams),
-              (("detector", "config"), detectorConfigParams)
-            ]
-        abort :: ActionM ()
-        abort = liftIO $ atomically $ putTMVar signalVar Abort
-        increaseSeriesId :: ActionM Int
-        increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
-        arm :: ActionM ()
-        arm = do
-          newSeriesId <- increaseSeriesId
-          -- changeDetectorState "idle" "ready"
-          liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
-          text (packShowLazy newSeriesId)
-          liftIO $ atomically $ putTMVar signalVar Arm
-        trigger = liftIO $ atomically $ putTMVar signalVar Trigger
-        disarm = liftIO $ atomically $ putTMVar signalVar Abort
-        commands :: Map.Map Text (ActionM ())
-        commands =
-          Map.fromList
-            [ ("abort", abort),
-              ("arm", arm),
-              ("trigger", trigger),
-              ("disarm", disarm)
-            ]
-    scotty 10_001 do
-      -- Annoying normally
-      -- middleware logStdoutDev
+  withOptions \options -> do
+    withTimedFastLogger timeCache (LogStdout defaultBufSize) \fastLogger -> do
+      let log msg = fastLogger (\time -> toLogStr time <> " " <> msg <> "\n")
 
-      get "/detector/api/:version/command/keys" do
-        json (Map.keys commands)
-      put "/detector/api/:version/command/:commandname" do
-        commandName <- pathParam "commandname"
-        case Map.lookup commandName commands of
-          Nothing -> status status404
-          Just command -> command
-      put "/:subsystem/api/:version/:configOrStatus/:parameter" do
-        subsystem <- pathParam "subsystem"
-        configOrStatus <- pathParam "configOrStatus"
-        case Map.lookup (subsystem, configOrStatus) mvarMap of
-          Nothing -> status status404
-          Just parameterMap -> do
-            parameter <- pathParam "parameter"
-            requestContent <- jsonData
-            case Map.lookup parameter parameterMap of
-              Nothing -> status status404
-              Just parameterDescription ->
-                liftIO $ modifyViaRequest requestContent parameterDescription
+      withHdf5FileAndDataSet options.inputH5File options.inputH5DatasetPath \ds -> do
+        log "opened data set, reading from it now"
+        dimensions <- getDataSetDimensions ds
+        log $ "dimensions: " <> packShow dimensions
+        let imageWidth = dimensions !! 1
+            imageHeight = dimensions !! 2
+        withImage ds [0, 0, 0] [1, imageWidth, imageHeight] [imageWidth, imageHeight] \image -> do
+          log $ "read image: " <> packShow (BS.length image) <> " bytes"
 
-      get "/:subsystem/api/:version/:configOrStatus/keys" do
-        subsystem <- pathParam "subsystem"
-        configOrStatus <- pathParam "configOrStatus"
-        case Map.lookup (subsystem, configOrStatus) mvarMap of
-          Nothing -> status status404
-          Just parameters -> json (Map.keys parameters)
-      get "/:subsystem/api/:version/:configOrStatus/:parameter" do
-        subsystem <- pathParam "subsystem"
-        configOrStatus <- pathParam "configOrStatus"
-        case Map.lookup (subsystem, configOrStatus) mvarMap of
-          Nothing -> status status404
-          Just parameterMap -> do
-            parameter <- pathParam "parameter"
-            case Map.lookup parameter parameterMap of
-              Nothing -> status status404
-              Just eigerParameter' -> do
-                resolvedValue <- liftIO $ readMVar eigerParameter'.value
-                let resolvedParameter :: EigerParameter EigerParameterValue
-                    resolvedParameter = eigerParameter' {value = resolvedValue}
-                json resolvedParameter
+      eigerConfig <- initialEigerConfig
+      let detectorStatusParams = initEigerDetectorStatusParameters eigerConfig
+          detectorConfigParams = initEigerDetectorConfigParameters eigerConfig
+          streamStatusParams = initEigerStreamStatusParameters eigerConfig
+          streamConfigParams = initEigerStreamConfigParameters eigerConfig
+          fileWriterStatusParams = initEigerFileWriterStatusParameters eigerConfig
+          fileWriterConfigParams = initEigerFileWriterConfigParameters eigerConfig
+      currentSeriesId :: MVar Int <- newMVar 0
+      currentTriggerId :: MVar Int <- newMVar 0
+      signalVar <- newEmptyTMVarIO
+      log "starting arm loop"
+      void $ forkIO (waitForArmLoop log signalVar eigerConfig)
+      let mvarMap :: Map.Map (Text, Text) MVarEigerParameterMap
+          mvarMap =
+            Map.fromList
+              [ (("stream", "status"), streamStatusParams),
+                (("stream", "config"), streamConfigParams),
+                (("filewriter", "status"), fileWriterStatusParams),
+                (("filewriter", "config"), fileWriterConfigParams),
+                (("detector", "status"), detectorStatusParams),
+                (("detector", "config"), detectorConfigParams)
+              ]
+          abort :: ActionM ()
+          abort = liftIO $ atomically $ putTMVar signalVar Abort
+          increaseSeriesId :: ActionM Int
+          increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
+          arm :: ActionM ()
+          arm = do
+            newSeriesId <- increaseSeriesId
+            -- changeDetectorState "idle" "ready"
+            liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
+            text (packShowLazy newSeriesId)
+            liftIO $ atomically $ putTMVar signalVar Arm
+          trigger = liftIO $ atomically $ putTMVar signalVar Trigger
+          disarm = liftIO $ atomically $ putTMVar signalVar Abort
+          commands :: Map.Map Text (ActionM ())
+          commands =
+            Map.fromList
+              [ ("abort", abort),
+                ("arm", arm),
+                ("trigger", trigger),
+                ("disarm", disarm)
+              ]
+      scotty options.listenPort do
+        when options.accessLogging (middleware logStdoutDev)
+
+        get "/detector/api/:version/command/keys" do
+          json (Map.keys commands)
+        put "/detector/api/:version/command/:commandname" do
+          commandName <- pathParam "commandname"
+          case Map.lookup commandName commands of
+            Nothing -> status status404
+            Just command -> command
+        put "/:subsystem/api/:version/:configOrStatus/:parameter" do
+          subsystem <- pathParam "subsystem"
+          configOrStatus <- pathParam "configOrStatus"
+          case Map.lookup (subsystem, configOrStatus) mvarMap of
+            Nothing -> status status404
+            Just parameterMap -> do
+              parameter <- pathParam "parameter"
+              requestContent <- jsonData
+              case Map.lookup parameter parameterMap of
+                Nothing -> status status404
+                Just parameterDescription ->
+                  liftIO $ modifyViaRequest requestContent parameterDescription
+
+        get "/:subsystem/api/:version/:configOrStatus/keys" do
+          subsystem <- pathParam "subsystem"
+          configOrStatus <- pathParam "configOrStatus"
+          case Map.lookup (subsystem, configOrStatus) mvarMap of
+            Nothing -> status status404
+            Just parameters -> json (Map.keys parameters)
+        get "/:subsystem/api/:version/:configOrStatus/:parameter" do
+          subsystem <- pathParam "subsystem"
+          configOrStatus <- pathParam "configOrStatus"
+          case Map.lookup (subsystem, configOrStatus) mvarMap of
+            Nothing -> status status404
+            Just parameterMap -> do
+              parameter <- pathParam "parameter"
+              case Map.lookup parameter parameterMap of
+                Nothing -> status status404
+                Just eigerParameter' -> do
+                  resolvedValue <- liftIO $ readMVar eigerParameter'.value
+                  let resolvedParameter :: EigerParameter EigerParameterValue
+                      resolvedParameter = eigerParameter' {value = resolvedValue}
+                  json resolvedParameter

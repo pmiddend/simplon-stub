@@ -3,7 +3,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 
-module Hdf5Raw where
+module Simplon.Hdf5Raw where
 
 import Foreign.C.Types (CInt (CInt), CLong(CLong), CUInt(CUInt), CULong(CULong))
 import Foreign.C.String (CString)
@@ -57,3 +57,6 @@ h5sSelectSet = #const H5S_SELECT_SET
 
 h5tNativeFloat :: HidT
 h5tNativeFloat = #const H5T_NATIVE_FLOAT
+
+h5tNativeUShort :: HidT
+h5tNativeUShort = #const H5T_NATIVE_USHORT

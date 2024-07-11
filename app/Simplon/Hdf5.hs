@@ -6,19 +6,30 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Hdf5 where
+module Simplon.Hdf5 (getDataSetDimensions, withHdf5FileAndDataSet, withImage) where
 
+import Control.Applicative (Applicative (pure))
 import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.ByteString (ByteString, packCStringLen)
+import Data.Foldable (Foldable (length, product))
+import Data.Function (($), (.))
+import Data.Functor ((<$>))
+import Data.Int (Int)
+import Data.List (replicate)
+import Data.Ord (Ord, (<))
+import Data.Semigroup ((<>))
 import Data.Text (Text, unpack)
 import Foreign (sizeOf)
 import Foreign.C.String (withCString)
-import Foreign.C.Types (CFloat)
+import Foreign.C.Types (CFloat, CUShort)
 import Foreign.Marshal (peekArray)
 import Foreign.Marshal.Array (allocaArray, withArray)
 import Foreign.Ptr (castPtr, nullPtr)
-import Hdf5Raw (HidT, h5dclose, h5dget_space, h5dopen, h5dread, h5fAccRdOnly, h5fCloseStrong, h5fclose, h5fopen, h5pDefault, h5pFileAccess, h5pclose, h5pcreate, h5pset_fclose_degree, h5sSelectSet, h5sclose, h5screate_simple, h5sget_simple_extent_dims, h5sget_simple_extent_ndims, h5sselect_hyperslab, h5tNativeFloat)
+import Simplon.Hdf5Raw (HidT, h5dclose, h5dget_space, h5dopen, h5dread, h5fAccRdOnly, h5fCloseStrong, h5fclose, h5fopen, h5pDefault, h5pFileAccess, h5pclose, h5pcreate, h5pset_fclose_degree, h5sSelectSet, h5sclose, h5screate_simple, h5sget_simple_extent_dims, h5sget_simple_extent_ndims, h5sselect_hyperslab, h5tNativeFloat, h5tNativeUShort)
+import System.IO (FilePath, IO)
+import Text.Show (Show (show))
+import Prelude (Num ((*)), error, fromIntegral, undefined)
 
 newtype Hdf5FileId = Hdf5FileId {ungetHdf5FileId :: HidT}
 
@@ -39,13 +50,13 @@ type DataPath = Text
 checkError :: (Num a, Show a, Ord a) => IO a -> IO ()
 checkError action = do
   err <- action
-  when (err < 0) $ error $ "error code " ++ show err
+  when (err < 0) $ error $ "error code " <> show err
 
 checkInvalidHid :: IO HidT -> IO HidT
 checkInvalidHid action = do
   err <- action
   if err < 0
-    then error $ "error code " ++ show err
+    then error $ "error code " <> show err
     else pure err
 
 openHdf5File :: FilePath -> IO Hdf5FileId
@@ -94,8 +105,8 @@ withHdf5FileAndDataSet fp dataPath f =
     withHdf5DataSet fileId dataPath \dataSetId ->
       withHdf5DataSpace dataSetId (f . Hdf5DataSet fileId dataSetId)
 
-getDimensions :: Hdf5DataSet -> IO [Int]
-getDimensions ds = do
+getDataSetDimensions :: Hdf5DataSet -> IO [Int]
+getDataSetDimensions ds = do
   let dataSpaceId = ungetHdf5DataSpaceId ds.hdf5DataSpaceId
   rank <- h5sget_simple_extent_ndims dataSpaceId
   withArray (replicate (fromIntegral rank) 0) $ \arrayPtr -> do
@@ -130,11 +141,14 @@ withImage ds hyperslabOffset hyperslabDim subslab f = do
       checkError
         ( h5dread
             (ungetHdf5DataSetId ds.hdf5DataSetId)
-            h5tNativeFloat
+            -- h5tNativeFloat
+            h5tNativeUShort
             oneImageMemspace
             dataSpaceId
             h5pDefault
-            (castPtr @CFloat @() imageDataPtr)
+            -- (castPtr @CFloat @() imageDataPtr)
+            (castPtr @CUShort @() imageDataPtr)
         )
-      byteString <- packCStringLen (castPtr imageDataPtr, sizeOf @CFloat undefined * product subslab)
+      -- byteString <- packCStringLen (castPtr imageDataPtr, sizeOf @CFloat undefined * product subslab)
+      byteString <- packCStringLen (castPtr imageDataPtr, sizeOf @CUShort undefined * product subslab)
       f byteString
