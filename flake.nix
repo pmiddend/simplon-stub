@@ -27,7 +27,7 @@
                 # hdf5 = pkgs.haskell.lib.markUnbroken super.hdf5;
                 # hdf5 = pkgs.stdenv.mkDerivation { name = "myhdf5"; };
                 # Looking weird? Rightfully so.
-                hdf5 = super.text;
+                # hdf5 = super.text;
               };
               # overrides = self: super: { };
             };
@@ -65,6 +65,7 @@
           packages.${packageName} =
             haskellPackages.callCabal2nix packageName self
               {
+                inherit (pkgs) hdf5;
                 scotty = haskellPackages.scotty_0_22;
               };
 
