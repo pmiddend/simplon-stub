@@ -23,6 +23,7 @@ executable simplon-stub
   other-modules: Simplon.Hdf5Raw
                , Simplon.Hdf5
                , Simplon.Options
+               , Simplon.Streaming
   hs-source-dirs:
       app
   build-depends:
@@ -30,9 +31,14 @@ executable simplon-stub
     , scotty
     , text
     , containers
+    -- for HTTP status codes
     , http-types
+    -- both Simplon HTTP and ZMQ need this
     , aeson
+    -- simplon ZMQ streaming interface
     , zeromq4-haskell
+    -- to calculate MD5 hashes in streaming interface
+    , crypton
     , fast-logger
     , bytestring
     , optparse-applicative

@@ -1,5 +1,4 @@
 {-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE OverloadedRecordDot #-}
 
 module Simplon.Options (Options (..), withOptions) where
 
@@ -7,7 +6,9 @@ import Control.Applicative ((<*>))
 import Data.Bool (Bool)
 import Data.Functor ((<$>))
 import Data.Int (Int)
+import Data.Maybe (Maybe)
 import Data.Semigroup (Semigroup ((<>)))
+import Data.String (String)
 import Data.Text (Text, pack)
 import qualified Options.Applicative as Opt
 import System.IO (FilePath, IO)
@@ -17,7 +18,8 @@ data Options = Options
   { listenPort :: Int,
     inputH5File :: FilePath,
     inputH5DatasetPath :: Text,
-    accessLogging :: Bool
+    accessLogging :: Bool,
+    zmqBindAddress :: Maybe String
   }
 
 optionsParser :: Opt.Parser Options
@@ -44,6 +46,7 @@ optionsParser =
     <*> Opt.switch
       ( Opt.long "access-logging" <> Opt.help "enable logging of every incoming request (tends to be spammy)"
       )
+    <*> Opt.optional (Opt.strOption (Opt.long "zmq-bind-address"))
 
 withOptions :: (Options -> IO a) -> IO a
 withOptions f = do
