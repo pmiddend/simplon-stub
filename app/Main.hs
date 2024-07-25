@@ -14,7 +14,7 @@ import Control.Concurrent (Chan, forkIO, newChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Concurrent.STM (atomically, registerDelay)
 import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
-import Control.Monad (forever, void, when)
+import Control.Monad (forM_, forever, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( FromJSON,
@@ -43,7 +43,7 @@ import Network.Wai.Middleware.RequestLogger (logStdoutDev)
 import Simplon.Hdf5 (Hdf5DataSet, getDataSetDimensions, withHdf5FileAndDataSet, withImage)
 import Simplon.Options (accessLogging, inputH5DatasetPath, inputH5File, listenPort, withOptions, zmqBindAddress)
 import Simplon.SeriesId (SeriesId (SeriesId))
-import Simplon.Streaming (StreamingEndOfSeriesData (StreamingEndOfSeriesData), StreamingHeaderData (StreamingHeaderData), StreamingMessage (StreamingEndOfSeries, StreamingHeader), appendix, series, streamingLoop)
+import Simplon.Streaming (StreamingEndOfSeriesData (StreamingEndOfSeriesData), StreamingHeaderData (StreamingHeaderData), StreamingImageData (StreamingImageData, frame, image, imageShape, realTimeNs, startTimeNs, stopTimeNs), StreamingMessage (StreamingEndOfSeries, StreamingHeader, StreamingImage), appendix, series, streamingLoop)
 import Simplon.Util (fini, overwriteMVar, packShow, packShowLazy)
 import System.IO (FilePath, IO)
 import System.Log.FastLogger (LogStr, LogType' (LogStdout), ToLogStr (toLogStr), defaultBufSize, newTimeCache, withTimedFastLogger)
@@ -322,12 +322,45 @@ data LoopConstantData = LoopConstantData
 data LoopSignal = Arm SeriesId | Trigger | Abort
 
 waitForImageLoop :: LoopConstantData -> TriggerAndImageState -> Maybe Hdf5State -> IO ()
-waitForImageLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig, loopStreamingConfig}) tais@(TriggerAndImageState {imageNtrigger, imageNtriggerLeft, imageFrameTime, imageNimagesTotal, imageNimagesLeft}) hdf5State = do
+waitForImageLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig, loopStreamingConfig}) tais@(TriggerAndImageState {imageSeriesId, imageNtriggerLeft, imageFrameTime, imageNimagesLeft}) hdf5State = do
   loopDataLog $ packShow imageNimagesLeft <> " image(s) left, waiting for this one"
   delay <- registerDelay (round (imageFrameTime * 1000) * 1000)
   result <- atomically ((Just <$> takeTMVar loopSignal) <|> (Nothing <$ fini delay))
   case result of
-    Nothing ->
+    Nothing -> do
+      for_ ((,) <$> loopStreamingConfig <*> hdf5State) \(streamingConfig', hdf5State') -> do
+        imageAppendix <- readMVar loopEigerConfig.streamImageAppendix
+        dimensions <- getDataSetDimensions hdf5State'.hdf5DataSet
+        let imageWidth = dimensions !! 1
+            imageHeight = dimensions !! 2
+            currentFrame = determineCurrentFrame tais
+        loopDataLog $ "current frame: " <> packShow currentFrame <> " opening and sending"
+        withImage
+          hdf5State'.hdf5DataSet
+          -- hyperslab offset
+          [currentFrame, 0, 0]
+          -- count: size of one image
+          [1, imageWidth, imageHeight]
+          -- buffer size
+          [imageWidth, imageHeight]
+          \image -> do
+            loopDataLog $ "read image: " <> packShow (BS.length image) <> " bytes"
+            writeChan
+              streamingConfig'.streamingChan
+              ( StreamingImage
+                  ( StreamingImageData
+                      { image = image,
+                        imageShape = dimensions,
+                        series = imageSeriesId,
+                        frame = currentFrame,
+                        startTimeNs = 0,
+                        stopTimeNs = 0,
+                        realTimeNs = 0,
+                        appendix = eigerParameterValueText imageAppendix
+                      }
+                  )
+              )
+
       if imageNimagesLeft <= 1
         then do
           overwriteMVar loopEigerConfig.detectorState (EigerValueText "ready")
@@ -385,8 +418,19 @@ initialTriggerAndImageState seriesId ntrigger nimages frameTime =
       imageNimagesLeft = nimages
     }
 
+determineCurrentFrame :: TriggerAndImageState -> Int
+determineCurrentFrame (TriggerAndImageState {imageNtrigger, imageNtriggerLeft, imageNimagesTotal, imageNimagesLeft}) =
+  let triggersSoFar = imageNtrigger - imageNtriggerLeft
+      imagesInThisTrigger = imageNimagesTotal - imageNimagesLeft
+   in triggersSoFar * imageNimagesTotal + imagesInThisTrigger
+
 decreaseTriggerCount :: TriggerAndImageState -> TriggerAndImageState
-decreaseTriggerCount tais = tais {imageNtriggerLeft = tais.imageNtriggerLeft - 1}
+decreaseTriggerCount tais =
+  -- after a successful trigger round, decrease trigger by 1 and increase images by the maximum amount
+  tais
+    { imageNtriggerLeft = tais.imageNtriggerLeft - 1,
+      imageNimagesLeft = tais.imageNimagesTotal
+    }
 
 decreaseImageCount :: TriggerAndImageState -> TriggerAndImageState
 decreaseImageCount tais = tais {imageNimagesLeft = tais.imageNimagesLeft - 1}
@@ -396,7 +440,7 @@ waitForTriggerLoop ::
   TriggerAndImageState ->
   Maybe Hdf5State ->
   IO ()
-waitForTriggerLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig, loopStreamingConfig}) triggerAndImageState hdf5State = do
+waitForTriggerLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig}) triggerAndImageState hdf5State = do
   loopDataLog "waiting for trigger signal"
   signal <- atomically (takeTMVar loopSignal)
   case signal of
@@ -501,14 +545,17 @@ main = do
 
       let streamingConfig = const (StreamingConfig streamingChan options.inputH5File options.inputH5DatasetPath) <$> options.zmqBindAddress
 
-      withHdf5FileAndDataSet options.inputH5File options.inputH5DatasetPath \ds -> do
-        log "opened data set, reading from it now"
-        dimensions <- getDataSetDimensions ds
-        log $ "dimensions: " <> packShow dimensions
-        let imageWidth = dimensions !! 1
-            imageHeight = dimensions !! 2
-        withImage ds [0, 0, 0] [1, imageWidth, imageHeight] [imageWidth, imageHeight] \image -> do
-          log $ "read image: " <> packShow (BS.length image) <> " bytes"
+      -- Test code to read 'n' images from the h5 file
+      -- withHdf5FileAndDataSet options.inputH5File options.inputH5DatasetPath \ds -> do
+      --   log "opened data set, reading from it now"
+      --   dimensions <- getDataSetDimensions ds
+      --   log $ "dimensions: " <> packShow dimensions
+      --   forM_ [0 .. 10] \imageIndex -> do
+      --     log $ "reading image " <> packShow imageIndex
+      --     let imageWidth = dimensions !! 1
+      --         imageHeight = dimensions !! 2
+      --     withImage ds [imageIndex, 0, 0] [1, imageWidth, imageHeight] [imageWidth, imageHeight] \image -> do
+      --       log $ "read image: " <> packShow (BS.length image) <> " bytes"
 
       eigerConfig <- initialEigerConfig
       let detectorStatusParams = initEigerDetectorStatusParameters eigerConfig

@@ -3,7 +3,7 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Simplon.Streaming (streamingLoop, StreamingMessage (..), StreamingHeaderData (..), StreamingEndOfSeriesData (..)) where
+module Simplon.Streaming (streamingLoop, StreamingMessage (..), StreamingHeaderData (..), StreamingEndOfSeriesData (..), StreamingImageData (..)) where
 
 import Control.Applicative (Applicative (pure))
 import Control.Concurrent (Chan, readChan)
@@ -207,14 +207,15 @@ serializeStreamingMessage (StreamingImage (StreamingImageData {image, imageShape
 
 streamingLoop :: (LogStr -> IO ()) -> String -> Chan StreamingMessage -> IO ()
 streamingLoop log bindAddress chan = withContext \context -> forever do
-  log "creating ZMQ socket"
+  log "zmq: creating ZMQ socket"
   withSocket context Push \socket -> do
-    log ("binding to ZMQ " <> toLogStr bindAddress)
+    log ("zmq: binding to ZMQ " <> toLogStr bindAddress)
     bind socket bindAddress
-    log "bind complete, starting wait loop"
+    log "zmq: bind complete, starting wait loop"
 
     forever do
+      log "zmq: waiting for ZMq messages"
       newMessage <- readChan chan
-      log "got a new message, sending"
+      log "zmq: got a new message, sending"
 
       sendMulti socket (serializeStreamingMessage newMessage)

@@ -50,7 +50,7 @@
             ];
 
             nativeBuildInputs = [ cmake ];
-            buildInputs = [ hdf5 lz4 bzip2 ];
+            buildInputs = [ hdf5-threadsafe lz4 bzip2 ];
 
             cmakeFlags = [
               "-DENABLE_BITSHUFFLE_PLUGIN=yes"
@@ -65,7 +65,8 @@
           packages.${packageName} =
             haskellPackages.callCabal2nix packageName self
               {
-                inherit (pkgs) hdf5;
+                # inherit (pkgs) hdf5;
+                hdf5 = pkgs.hdf5-threadsafe;
                 scotty = haskellPackages.scotty_0_22;
               };
 
@@ -82,7 +83,7 @@
                 haskellPackages.hlint
                 haskellPackages.apply-refact
                 pkg-config
-                hdf5
+                hdf5-threadsafe
               ];
               inputsFrom = [ self.packages.${system}.simplon-stub-hs.env ];
               HDF5_PLUGIN_PATH = "${hdf5-external-filter-plugins}/lib/plugins";
