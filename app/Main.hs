@@ -10,14 +10,12 @@
 module Main (main) where
 
 import Control.Applicative (Alternative ((<|>)), Applicative (pure, (<*>)))
-import Control.Concurrent (forkIO)
+import Control.Concurrent (Chan, forkIO, newChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
-import Control.Concurrent.STM (TVar, atomically, check, registerDelay)
+import Control.Concurrent.STM (atomically, registerDelay)
 import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
-import Control.Concurrent.STM.TVar (readTVar)
-import Control.Monad (forever, void, when, (<=<))
+import Control.Monad (forever, void, when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.STM (STM)
 import Data.Aeson
   ( FromJSON,
     KeyValue ((.=)),
@@ -30,8 +28,8 @@ import Data.Aeson
   )
 import Data.Bool (Bool, not)
 import qualified Data.ByteString as BS
-import Data.Foldable (Foldable (null))
-import Data.Function (const, ($), (.))
+import Data.Foldable (Foldable (null), for_)
+import Data.Function (const, ($))
 import Data.Functor (Functor ((<$)), (<$>))
 import Data.Int (Int)
 import Data.List ((!!))
@@ -40,14 +38,16 @@ import Data.Maybe (Maybe (Just, Nothing), maybe)
 import Data.Ord (Ord ((>)))
 import Data.Semigroup (Semigroup ((<>)))
 import Data.Text (Text)
-import qualified Data.Text.Lazy as TL
 import Network.HTTP.Types.Status (status404)
 import Network.Wai.Middleware.RequestLogger (logStdoutDev)
-import Simplon.Hdf5 (getDataSetDimensions, withHdf5FileAndDataSet, withImage)
-import Simplon.Options (accessLogging, inputH5DatasetPath, inputH5File, listenPort, withOptions)
-import System.IO (IO)
+import Simplon.Hdf5 (Hdf5DataSet, getDataSetDimensions, withHdf5FileAndDataSet, withImage)
+import Simplon.Options (accessLogging, inputH5DatasetPath, inputH5File, listenPort, withOptions, zmqBindAddress)
+import Simplon.SeriesId (SeriesId (SeriesId))
+import Simplon.Streaming (StreamingEndOfSeriesData (StreamingEndOfSeriesData), StreamingHeaderData (StreamingHeaderData), StreamingMessage (StreamingEndOfSeries, StreamingHeader), appendix, series, streamingLoop)
+import Simplon.Util (fini, overwriteMVar, packShow, packShowLazy)
+import System.IO (FilePath, IO)
 import System.Log.FastLogger (LogStr, LogType' (LogStdout), ToLogStr (toLogStr), defaultBufSize, newTimeCache, withTimedFastLogger)
-import Text.Show (Show (show))
+import Text.Show (Show)
 import Web.Scotty (ActionM, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
 import Prelude (Float, Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
 
@@ -57,6 +57,10 @@ data EigerParameterValue
   | EigerValueText !Text
   | EigerValueInt !Int
   deriving (Show)
+
+eigerParameterValueText :: EigerParameterValue -> Maybe Text
+eigerParameterValueText (EigerValueText t) = Just t
+eigerParameterValueText _ = Nothing
 
 instance ToJSON EigerParameterValue where
   toJSON (EigerValueFloat f) = toJSON f
@@ -308,96 +312,177 @@ modifyViaRequest putRequest p = modifyMVar_ p.value \currentValue ->
               _ -> error "invalid request content"
        in pure newValue
 
-packShow :: (Show a) => a -> LogStr
-packShow = toLogStr . show
+data LoopConstantData = LoopConstantData
+  { loopDataLog :: LogStr -> IO (),
+    loopSignal :: TMVar LoopSignal,
+    loopEigerConfig :: EigerConfig,
+    loopStreamingConfig :: Maybe StreamingConfig
+  }
 
-packShowLazy :: (Show a) => a -> TL.Text
-packShowLazy = TL.pack . show
+data LoopSignal = Arm SeriesId | Trigger | Abort
 
-data LoopSignal = Arm | Trigger | Abort
-
-fini :: TVar Bool -> STM ()
-fini = check <=< readTVar
-
-overwriteMVar :: MVar a -> a -> IO ()
-overwriteMVar var value = modifyMVar_ var (const (pure value))
-
-waitForImageLoop :: (LogStr -> IO ()) -> TMVar LoopSignal -> Int -> Int -> Int -> Float -> EigerConfig -> IO ()
-waitForImageLoop log signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig = do
-  log $ packShow nimagesLeft <> " image(s) left, waiting for this one"
-  delay <- registerDelay (round (frameTime * 1000) * 1000)
-  result <- atomically ((Just <$> takeTMVar signalVar) <|> (Nothing <$ fini delay))
+waitForImageLoop :: LoopConstantData -> TriggerAndImageState -> Maybe Hdf5State -> IO ()
+waitForImageLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig, loopStreamingConfig}) tais@(TriggerAndImageState {imageNtrigger, imageNtriggerLeft, imageFrameTime, imageNimagesTotal, imageNimagesLeft}) hdf5State = do
+  loopDataLog $ packShow imageNimagesLeft <> " image(s) left, waiting for this one"
+  delay <- registerDelay (round (imageFrameTime * 1000) * 1000)
+  result <- atomically ((Just <$> takeTMVar loopSignal) <|> (Nothing <$ fini delay))
   case result of
     Nothing ->
-      if nimagesLeft <= 1
+      if imageNimagesLeft <= 1
         then do
-          overwriteMVar eigerConfig.detectorState (EigerValueText "ready")
-          overwriteMVar eigerConfig.streamState (EigerValueText "ready")
-          if ntriggerLeft > 1
+          overwriteMVar loopEigerConfig.detectorState (EigerValueText "ready")
+          overwriteMVar loopEigerConfig.streamState (EigerValueText "ready")
+          if imageNtriggerLeft > 1
             then do
-              log $ "no images left, but " <> packShow (ntriggerLeft - 1) <> " trigger(s)"
-              waitForTriggerLoop log signalVar (ntriggerLeft - 1) nimagesTotal frameTime eigerConfig
+              loopDataLog $ "no images left, but " <> packShow (imageNtriggerLeft - 1) <> " trigger(s)"
+              waitForTriggerLoop loopData (decreaseTriggerCount tais) hdf5State
             else do
-              log "no images left, no triggers left"
-              overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
-              overwriteMVar eigerConfig.streamState (EigerValueText "ready")
+              loopDataLog "no images left, no triggers left"
+              overwriteMVar loopEigerConfig.detectorState (EigerValueText "idle")
+              overwriteMVar loopEigerConfig.streamState (EigerValueText "ready")
         else do
-          log $ packShow (nimagesLeft - 1) <> " image(s) left"
-          waitForImageLoop log signalVar ntriggerLeft nimagesTotal (nimagesLeft - 1) frameTime eigerConfig
-    Just Arm -> do
-      log "spurious arm received, ignoring..."
-      waitForImageLoop log signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
+          loopDataLog $ packShow (imageNimagesLeft - 1) <> " image(s) left"
+          waitForImageLoop loopData (decreaseImageCount tais) hdf5State
+    Just (Arm differentSeriesId) -> do
+      loopDataLog $ "spurious arm received (series " <> packShow differentSeriesId <> "), ignoring..."
+      waitForImageLoop loopData tais hdf5State
     Just Trigger -> do
-      log "spurious trigger received, ignoring..."
-      waitForImageLoop log signalVar ntriggerLeft nimagesTotal nimagesLeft frameTime eigerConfig
+      loopDataLog "spurious trigger received, ignoring..."
+      waitForImageLoop loopData tais hdf5State
     Just Abort -> do
-      log "abort received"
-      overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
-      overwriteMVar eigerConfig.streamState (EigerValueText "ready")
+      loopDataLog "abort received"
+      overwriteMVar loopEigerConfig.detectorState (EigerValueText "idle")
+      overwriteMVar loopEigerConfig.streamState (EigerValueText "ready")
 
-waitForTriggerLoop :: (LogStr -> IO ()) -> TMVar LoopSignal -> Int -> Int -> Float -> EigerConfig -> IO ()
-waitForTriggerLoop log signalVar ntrigger nimages frameTime eigerConfig = do
-  log "waiting for trigger signal"
-  signal <- atomically (takeTMVar signalVar)
+data StreamingConfig = StreamingConfig
+  { streamingChan :: Chan StreamingMessage,
+    streamingH5File :: FilePath,
+    streamingH5DatasetPath :: Text
+  }
+
+data Hdf5State = Hdf5State
+  { hdf5DataSet :: Hdf5DataSet,
+    hdf5ImageNumber :: Int
+  }
+
+data TriggerAndImageState = TriggerAndImageState
+  { imageSeriesId :: SeriesId,
+    imageNtrigger :: Int,
+    imageNtriggerLeft :: Int,
+    imageFrameTime :: Float,
+    imageNimagesTotal :: Int,
+    imageNimagesLeft :: Int
+  }
+
+initialTriggerAndImageState :: SeriesId -> Int -> Int -> Float -> TriggerAndImageState
+initialTriggerAndImageState seriesId ntrigger nimages frameTime =
+  TriggerAndImageState
+    { imageSeriesId = seriesId,
+      imageNtrigger = ntrigger,
+      imageNtriggerLeft = ntrigger,
+      imageFrameTime = frameTime,
+      imageNimagesTotal = nimages,
+      imageNimagesLeft = nimages
+    }
+
+decreaseTriggerCount :: TriggerAndImageState -> TriggerAndImageState
+decreaseTriggerCount tais = tais {imageNtriggerLeft = tais.imageNtriggerLeft - 1}
+
+decreaseImageCount :: TriggerAndImageState -> TriggerAndImageState
+decreaseImageCount tais = tais {imageNimagesLeft = tais.imageNimagesLeft - 1}
+
+waitForTriggerLoop ::
+  LoopConstantData ->
+  TriggerAndImageState ->
+  Maybe Hdf5State ->
+  IO ()
+waitForTriggerLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig, loopStreamingConfig}) triggerAndImageState hdf5State = do
+  loopDataLog "waiting for trigger signal"
+  signal <- atomically (takeTMVar loopSignal)
   case signal of
     Abort -> do
-      log "waited for trigger, but got abort"
-      overwriteMVar eigerConfig.detectorState (EigerValueText "idle")
-      overwriteMVar eigerConfig.streamState (EigerValueText "ready")
-    Arm -> log "waited for trigger, but got arm - ignoring..."
+      loopDataLog "waited for trigger, but got abort"
+      overwriteMVar loopEigerConfig.detectorState (EigerValueText "idle")
+      overwriteMVar loopEigerConfig.streamState (EigerValueText "ready")
+    Arm differentSeriesId ->
+      loopDataLog $ "waited for trigger, but got arm (series " <> packShow differentSeriesId <> ") - ignoring..."
     Trigger -> do
-      log "got trigger signal, waiting for images"
-      overwriteMVar eigerConfig.detectorState (EigerValueText "acquire")
-      overwriteMVar eigerConfig.streamState (EigerValueText "acquire")
-      waitForImageLoop log signalVar ntrigger nimages nimages frameTime eigerConfig
+      loopDataLog "got trigger signal, waiting for images"
+      overwriteMVar loopEigerConfig.detectorState (EigerValueText "acquire")
+      overwriteMVar loopEigerConfig.streamState (EigerValueText "acquire")
+      waitForImageLoop loopData triggerAndImageState hdf5State
 
--- This implementation is wrong - we need to wait for triggers _and_ images (nimages vs. ntrigger)
--- This loop runs in parallel to the main server and initiates the triggering.
-waitForArmLoop :: (LogStr -> IO ()) -> TMVar LoopSignal -> EigerConfig -> IO ()
-waitForArmLoop log signalVar eigerConfig = forever do
-  log "waiting for arm signal"
-  signal <- atomically (takeTMVar signalVar)
-  case signal of
-    Abort -> log "abort, but not triggering; ignoring"
-    Arm -> do
-      ntrigger <- readMVar eigerConfig.ntrigger
-      nimages <- readMVar eigerConfig.nimages
-      frameTime <- readMVar eigerConfig.frameTime
+waitForArmLoop :: LoopConstantData -> IO ()
+waitForArmLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerConfig, loopStreamingConfig}) =
+  forever do
+    loopDataLog "waiting for arm signal"
+    signal <- atomically (takeTMVar loopSignal)
+    case signal of
+      Abort -> loopDataLog "abort, but not triggering; ignoring"
+      Arm seriesId -> do
+        ntrigger <- readMVar loopEigerConfig.ntrigger
+        nimages <- readMVar loopEigerConfig.nimages
+        frameTime <- readMVar loopEigerConfig.frameTime
 
-      case ntrigger of
-        EigerValueInt ntrigger' ->
-          case frameTime of
-            EigerValueFloat frameTime' ->
-              case nimages of
-                EigerValueInt nimages' -> do
-                  overwriteMVar eigerConfig.detectorState (EigerValueText "ready")
-                  overwriteMVar eigerConfig.streamState (EigerValueText "ready")
-                  log $ "armed, waiting for " <> packShow ntrigger' <> " trigger(s), " <> packShow nimages' <> " image(s)"
-                  waitForTriggerLoop log signalVar ntrigger' nimages' frameTime' eigerConfig
-                _ -> log "error reading nimages"
-            _ -> log "error reading frame time"
-        _ -> log "error reading ntrigger"
-    Trigger -> log "trigger received, ignoring"
+        case ntrigger of
+          EigerValueInt ntrigger' ->
+            case frameTime of
+              EigerValueFloat frameTime' ->
+                case nimages of
+                  EigerValueInt nimages' -> do
+                    overwriteMVar loopEigerConfig.detectorState (EigerValueText "ready")
+                    overwriteMVar loopEigerConfig.streamState (EigerValueText "ready")
+                    loopDataLog $
+                      "armed, waiting for "
+                        <> packShow ntrigger'
+                        <> " trigger(s), "
+                        <> packShow nimages'
+                        <> " image(s)"
+
+                    for_ loopStreamingConfig \streamingConfig' -> do
+                      headerAppendix <- readMVar loopEigerConfig.streamHeaderAppendix
+                      writeChan
+                        streamingConfig'.streamingChan
+                        ( StreamingHeader
+                            ( StreamingHeaderData
+                                { series = seriesId,
+                                  appendix = eigerParameterValueText headerAppendix
+                                }
+                            )
+                        )
+
+                    case loopStreamingConfig of
+                      Nothing ->
+                        waitForTriggerLoop
+                          loopData
+                          (initialTriggerAndImageState seriesId ntrigger' nimages' frameTime')
+                          Nothing
+                      Just (StreamingConfig {streamingH5File, streamingH5DatasetPath}) ->
+                        withHdf5FileAndDataSet streamingH5File streamingH5DatasetPath \hdf5File ->
+                          waitForTriggerLoop
+                            loopData
+                            (initialTriggerAndImageState seriesId ntrigger' nimages' frameTime')
+                            ( Just
+                                ( Hdf5State
+                                    { hdf5DataSet = hdf5File,
+                                      hdf5ImageNumber = 0
+                                    }
+                                )
+                            )
+
+                    for_ loopStreamingConfig \streamingConfig' -> do
+                      writeChan
+                        streamingConfig'.streamingChan
+                        ( StreamingEndOfSeries
+                            ( StreamingEndOfSeriesData
+                                { series = seriesId
+                                }
+                            )
+                        )
+                  _ -> loopDataLog "error reading nimages"
+              _ -> loopDataLog "error reading frame time"
+          _ -> loopDataLog "error reading ntrigger"
+      Trigger -> loopDataLog "trigger received, ignoring"
 
 main :: IO ()
 main = do
@@ -405,6 +490,16 @@ main = do
   withOptions \options -> do
     withTimedFastLogger timeCache (LogStdout defaultBufSize) \fastLogger -> do
       let log msg = fastLogger (\time -> toLogStr time <> " " <> msg <> "\n")
+
+      streamingChan <- newChan
+
+      -- The loop runs forever until main stops, so we don't need the thread ID
+      for_ options.zmqBindAddress \zmqBindAddress' ->
+        void $
+          forkIO $
+            streamingLoop log zmqBindAddress' streamingChan
+
+      let streamingConfig = const (StreamingConfig streamingChan options.inputH5File options.inputH5DatasetPath) <$> options.zmqBindAddress
 
       withHdf5FileAndDataSet options.inputH5File options.inputH5DatasetPath \ds -> do
         log "opened data set, reading from it now"
@@ -426,7 +521,7 @@ main = do
       currentTriggerId :: MVar Int <- newMVar 0
       signalVar <- newEmptyTMVarIO
       log "starting arm loop"
-      void $ forkIO (waitForArmLoop log signalVar eigerConfig)
+      void $ forkIO $ waitForArmLoop (LoopConstantData log signalVar eigerConfig streamingConfig)
       let mvarMap :: Map.Map (Text, Text) MVarEigerParameterMap
           mvarMap =
             Map.fromList
@@ -439,15 +534,15 @@ main = do
               ]
           abort :: ActionM ()
           abort = liftIO $ atomically $ putTMVar signalVar Abort
-          increaseSeriesId :: ActionM Int
-          increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, currentId + 1))
+          increaseSeriesId :: ActionM SeriesId
+          increaseSeriesId = liftIO $ modifyMVar currentSeriesId (\currentId -> pure (currentId + 1, SeriesId (currentId + 1)))
           arm :: ActionM ()
           arm = do
             newSeriesId <- increaseSeriesId
             -- changeDetectorState "idle" "ready"
             liftIO $ modifyMVar_ currentTriggerId (const (pure 0))
             text (packShowLazy newSeriesId)
-            liftIO $ atomically $ putTMVar signalVar Arm
+            liftIO $ atomically $ putTMVar signalVar (Arm newSeriesId)
           trigger = liftIO $ atomically $ putTMVar signalVar Trigger
           disarm = liftIO $ atomically $ putTMVar signalVar Abort
           commands :: Map.Map Text (ActionM ())

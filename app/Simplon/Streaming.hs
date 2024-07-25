@@ -3,14 +3,14 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Simplon.Streaming (streamingLoop, StreamingMessage (..)) where
+module Simplon.Streaming (streamingLoop, StreamingMessage (..), StreamingHeaderData (..), StreamingEndOfSeriesData (..)) where
 
 import Control.Applicative (Applicative (pure))
 import Control.Concurrent (Chan, readChan)
 import Control.Monad (forever)
 import qualified Crypto.Hash as Crypto
 import Crypto.Hash.Algorithms (MD5)
-import Data.Aeson (KeyValue ((.=)), ToJSON (toJSON), Value, encode, object)
+import Data.Aeson (KeyValue ((.=)), ToJSON (toJSON), encode, object)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
@@ -23,7 +23,9 @@ import Data.Semigroup (Semigroup ((<>)))
 import Data.String (String)
 import Data.Text (Text, pack)
 import qualified Data.Text.Encoding as TE
+import Simplon.SeriesId (SeriesId (SeriesId))
 import System.IO (IO)
+import System.Log.FastLogger (LogStr, ToLogStr (toLogStr))
 import System.ZMQ4 (Push (Push), bind, sendMulti, withContext, withSocket)
 import Text.Show (Show (show))
 import Prelude ()
@@ -51,7 +53,7 @@ instance ToJSON GlobalHeaderPart1 where
         "header_detail" .= headerDetail
       ]
 
-type GlobalHeaderPart2 = Value
+-- type GlobalHeaderPart2 = Value
 
 newtype GlobalHeaderPart3 = GlobalHeaderPart3
   { shape :: (Int, Int)
@@ -65,7 +67,7 @@ instance ToJSON GlobalHeaderPart3 where
         "type" .= ("float32" :: Text)
       ]
 
-type GlobalHeaderPart4 = ByteString
+-- type GlobalHeaderPart4 = ByteString
 
 newtype GlobalHeaderPart5 = GlobalHeaderPart5
   { shape :: (Int, Int)
@@ -79,7 +81,7 @@ instance ToJSON GlobalHeaderPart5 where
         "type" .= ("uint32" :: Text)
       ]
 
-type GlobalHeaderPart6 = ByteString
+-- type GlobalHeaderPart6 = ByteString
 
 newtype GlobalHeaderPart7 = GlobalHeaderPart7
   { shape :: (Int, Int)
@@ -93,7 +95,7 @@ instance ToJSON GlobalHeaderPart7 where
         "type" .= ("float32" :: Text)
       ]
 
-type GlobalHeaderPart8 = ByteString
+-- type GlobalHeaderPart8 = ByteString
 
 data ImageDataPart1 = ImageDataPart1
   { series :: Int,
@@ -128,7 +130,7 @@ instance ToJSON ImageDataPart2 where
         "size" .= size
       ]
 
-type ImageDataPart3 = ByteString
+-- type ImageDataPart3 = ByteString
 
 data ImageDataPart4 = ImageDataPart4
   { startTime :: Int,
@@ -156,12 +158,15 @@ instance ToJSON EndOfSeries where
         "series" .= series
       ]
 
-data StreamingHeaderData = StreamingHeaderData {series :: Int, appendix :: Maybe Text}
+data StreamingHeaderData = StreamingHeaderData
+  { series :: SeriesId,
+    appendix :: Maybe Text
+  }
 
 data StreamingImageData = StreamingImageData
   { image :: ByteString,
     imageShape :: [Int],
-    series :: Int,
+    series :: SeriesId,
     frame :: Int,
     startTimeNs :: Int,
     stopTimeNs :: Int,
@@ -169,7 +174,7 @@ data StreamingImageData = StreamingImageData
     appendix :: Maybe Text
   }
 
-newtype StreamingEndOfSeriesData = StreamingEndOfSeriesData {series :: Int}
+newtype StreamingEndOfSeriesData = StreamingEndOfSeriesData {series :: SeriesId}
 
 data StreamingMessage
   = StreamingHeader StreamingHeaderData
@@ -180,11 +185,11 @@ md5HashAsText :: ByteString -> Text
 md5HashAsText bs = pack (show (Crypto.hash bs :: Crypto.Digest MD5))
 
 serializeStreamingMessage :: StreamingMessage -> NE.NonEmpty ByteString
-serializeStreamingMessage (StreamingHeader (StreamingHeaderData {series, appendix})) =
-  encodeJsonStrict (GlobalHeaderPart1 {series = series, headerDetail = None}) NE.:| maybe [] (pure . TE.encodeUtf8) appendix
-serializeStreamingMessage (StreamingEndOfSeries (StreamingEndOfSeriesData {series})) =
-  NE.singleton $ encodeJsonStrict (EndOfSeries {series = series})
-serializeStreamingMessage (StreamingImage (StreamingImageData {image, imageShape, series, frame, startTimeNs, stopTimeNs, realTimeNs, appendix})) =
+serializeStreamingMessage (StreamingHeader (StreamingHeaderData {series = SeriesId series', appendix})) =
+  encodeJsonStrict (GlobalHeaderPart1 {series = series', headerDetail = None}) NE.:| maybe [] (pure . TE.encodeUtf8) appendix
+serializeStreamingMessage (StreamingEndOfSeries (StreamingEndOfSeriesData {series = SeriesId series'})) =
+  NE.singleton $ encodeJsonStrict (EndOfSeries {series = series'})
+serializeStreamingMessage (StreamingImage (StreamingImageData {image, imageShape, series = SeriesId series', frame, startTimeNs, stopTimeNs, realTimeNs, appendix})) =
   let part2 =
         ImageDataPart2
           { -- shape is reversed for some reason
@@ -195,16 +200,16 @@ serializeStreamingMessage (StreamingImage (StreamingImageData {image, imageShape
           }
       part2Bytes = encodeJsonStrict part2
       part2Hash = md5HashAsText part2Bytes
-      part1Bytes = encodeJsonStrict $ ImageDataPart1 {series = series, frame = frame, hash = part2Hash}
+      part1Bytes = encodeJsonStrict $ ImageDataPart1 {series = series', frame = frame, hash = part2Hash}
       part3Bytes = image
       part4Bytes = encodeJsonStrict $ ImageDataPart4 {startTime = startTimeNs, stopTime = stopTimeNs, realTime = realTimeNs}
    in part1Bytes NE.:| ([part2Bytes, part3Bytes, part4Bytes] <> maybe [] (pure . TE.encodeUtf8) appendix)
 
-streamingLoop :: (Text -> IO ()) -> String -> Chan StreamingMessage -> IO ()
+streamingLoop :: (LogStr -> IO ()) -> String -> Chan StreamingMessage -> IO ()
 streamingLoop log bindAddress chan = withContext \context -> forever do
   log "creating ZMQ socket"
   withSocket context Push \socket -> do
-    log ("binding to ZMQ " <> pack bindAddress)
+    log ("binding to ZMQ " <> toLogStr bindAddress)
     bind socket bindAddress
     log "bind complete, starting wait loop"
 

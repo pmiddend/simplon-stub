@@ -46,7 +46,7 @@ optionsParser =
     <*> Opt.switch
       ( Opt.long "access-logging" <> Opt.help "enable logging of every incoming request (tends to be spammy)"
       )
-    <*> Opt.optional (Opt.strOption (Opt.long "zmq-bind-address"))
+    <*> Opt.optional (Opt.strOption (Opt.long "zmq-bind-address" <> Opt.help "Binding address for ZeroMQ streaming interface, if that's desired. Example: tcp://*:5555"))
 
 withOptions :: (Options -> IO a) -> IO a
 withOptions f = do

@@ -6,7 +6,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Simplon.Hdf5 (getDataSetDimensions, withHdf5FileAndDataSet, withImage) where
+module Simplon.Hdf5 (getDataSetDimensions, withHdf5FileAndDataSet, withImage, Hdf5DataSet) where
 
 import Control.Applicative (Applicative (pure))
 import Control.Exception (bracket)

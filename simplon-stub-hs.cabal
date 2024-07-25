@@ -24,6 +24,8 @@ executable simplon-stub
                , Simplon.Hdf5
                , Simplon.Options
                , Simplon.Streaming
+               , Simplon.Util
+               , Simplon.SeriesId
   hs-source-dirs:
       app
   build-depends:
