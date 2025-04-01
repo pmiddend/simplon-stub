@@ -350,7 +350,7 @@ waitForImageLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerC
               ( StreamingImage
                   ( StreamingImageData
                       { image = image,
-                        imageShape = dimensions,
+                        imageShape = [imageWidth, imageHeight],
                         series = imageSeriesId,
                         frame = currentFrame,
                         startTimeNs = 0,
