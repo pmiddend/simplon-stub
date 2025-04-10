@@ -104,6 +104,7 @@
                 description = "Simplon HTTP stub server";
                 after = [ "network.target" ];
                 wantedBy = [ "multi-user.target" ];
+                environment.HDF5_PLUGIN_PATH = "${hdf5-external-filter-plugins}/lib/plugins";
 
                 serviceConfig = {
                   User = "simplon";
