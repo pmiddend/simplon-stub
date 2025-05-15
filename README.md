@@ -1,5 +1,7 @@
 # simplon-stub-hs
 
+![Build](https://github.com/pmiddend/simplon-stub/actions/workflows/build-with-nix.yaml/badge.svg)
+
 A program mimicking the Dectris' detector's Simplon API, reading a H5 file and outputting it via ZeroMQ.
 
 ## Usage
