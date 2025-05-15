@@ -23,6 +23,8 @@ executable simplon-stub
   other-modules: Simplon.Hdf5Raw
                , Simplon.Hdf5
                , Simplon.Options
+               , Simplon.EigerParameterValue
+               , Simplon.EigerParameterNameValue
                , Simplon.Streaming
                , Simplon.Util
                , Simplon.SeriesId

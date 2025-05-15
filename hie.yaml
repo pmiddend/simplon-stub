@@ -1,0 +1,11 @@
+# copied from https://github.com/haskell/haskell-language-server/issues/3735
+cradle:
+  multi:
+    - path: "./Setup.hs"
+      config: 
+        cradle:
+          none:
+    - path: "./"
+      config: 
+        cradle: 
+          cabal:

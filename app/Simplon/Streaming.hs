@@ -10,19 +10,23 @@ import Control.Concurrent (Chan, readChan)
 import Control.Monad (forever)
 import qualified Crypto.Hash as Crypto
 import Crypto.Hash.Algorithms (MD5)
-import Data.Aeson (KeyValue ((.=)), ToJSON (toJSON), encode, object)
+import Data.Aeson (KeyValue ((.=)), ToJSON (toJSON), Value (Object), encode, object)
+import Data.Aeson.KeyMap (KeyMap)
+import qualified Data.Aeson.KeyMap as KeyMap
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
+import Data.Foldable (foldMap)
 import Data.Function (($), (.))
 import Data.Int (Int)
-import Data.List (reverse)
+import Data.List (reverse, singleton)
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe (Maybe, maybe)
 import Data.Semigroup (Semigroup ((<>)))
-import Data.String (String)
-import Data.Text (Text, pack)
+import Data.String (String, fromString)
+import Data.Text (Text, pack, unpack)
 import qualified Data.Text.Encoding as TE
+import Simplon.EigerParameterNameValue (EigerParameterNameValue (EigerParameterNameValue, name, value))
 import Simplon.SeriesId (SeriesId (SeriesId))
 import System.IO (IO)
 import System.Log.FastLogger (LogStr, ToLogStr (toLogStr))
@@ -159,8 +163,9 @@ instance ToJSON EndOfSeries where
       ]
 
 data StreamingHeaderData = StreamingHeaderData
-  { series :: SeriesId,
-    appendix :: Maybe Text
+  { series :: !SeriesId,
+    config :: !(Maybe [EigerParameterNameValue]),
+    appendix :: !(Maybe Text)
   }
 
 data StreamingImageData = StreamingImageData
@@ -184,9 +189,15 @@ data StreamingMessage
 md5HashAsText :: ByteString -> Text
 md5HashAsText bs = pack (show (Crypto.hash bs :: Crypto.Digest MD5))
 
+serializeConfig :: [EigerParameterNameValue] -> [ByteString]
+serializeConfig = singleton . encodeJsonStrict . Object . valuesToKeyMap
+
+valuesToKeyMap :: [EigerParameterNameValue] -> KeyMap Value
+valuesToKeyMap = foldMap (\(EigerParameterNameValue {name, value}) -> KeyMap.singleton (fromString (unpack name)) (toJSON value))
+
 serializeStreamingMessage :: StreamingMessage -> NE.NonEmpty ByteString
-serializeStreamingMessage (StreamingHeader (StreamingHeaderData {series = SeriesId series', appendix})) =
-  encodeJsonStrict (GlobalHeaderPart1 {series = series', headerDetail = None}) NE.:| maybe [] (pure . TE.encodeUtf8) appendix
+serializeStreamingMessage (StreamingHeader (StreamingHeaderData {series = SeriesId series', config, appendix})) =
+  encodeJsonStrict (GlobalHeaderPart1 {series = series', headerDetail = Basic}) NE.:| (maybe [] serializeConfig config <> maybe [] (pure . TE.encodeUtf8) appendix)
 serializeStreamingMessage (StreamingEndOfSeries (StreamingEndOfSeriesData {series = SeriesId series'})) =
   NE.singleton $ encodeJsonStrict (EndOfSeries {series = series'})
 serializeStreamingMessage (StreamingImage (StreamingImageData {image, imageShape, series = SeriesId series', frame, startTimeNs, stopTimeNs, realTimeNs, appendix})) =
@@ -214,7 +225,7 @@ streamingLoop log bindAddress chan = withContext \context -> forever do
     log "zmq: bind complete, starting wait loop"
 
     forever do
-      log "zmq: waiting for ZMq messages"
+      log "zmq: waiting for ZMQ messages"
       newMessage <- readChan chan
       log "zmq: got a new message, sending"
 

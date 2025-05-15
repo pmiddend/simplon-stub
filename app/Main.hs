@@ -14,7 +14,7 @@ import Control.Concurrent (Chan, forkIO, newChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Concurrent.STM (atomically, registerDelay)
 import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
-import Control.Monad (forM_, forever, void, when)
+import Control.Monad (forever, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( FromJSON,
@@ -26,7 +26,7 @@ import Data.Aeson
     withObject,
     (.:),
   )
-import Data.Bool (Bool, not)
+import Data.Bool (not)
 import qualified Data.ByteString as BS
 import Data.Foldable (Foldable (null), for_)
 import Data.Function (const, ($))
@@ -40,33 +40,17 @@ import Data.Semigroup (Semigroup ((<>)))
 import Data.Text (Text)
 import Network.HTTP.Types.Status (status404)
 import Network.Wai.Middleware.RequestLogger (logStdoutDev)
+import Simplon.EigerParameterNameValue (EigerParameterNameValue (EigerParameterNameValue, name, value))
+import Simplon.EigerParameterValue (EigerParameterValue (EigerValueFloat, EigerValueInt, EigerValueText), eigerParameterValueText)
 import Simplon.Hdf5 (Hdf5DataSet, getDataSetDimensions, withHdf5FileAndDataSet, withImage)
 import Simplon.Options (accessLogging, inputH5DatasetPath, inputH5File, listenPort, withOptions, zmqBindAddress)
 import Simplon.SeriesId (SeriesId (SeriesId))
-import Simplon.Streaming (StreamingEndOfSeriesData (StreamingEndOfSeriesData), StreamingHeaderData (StreamingHeaderData), StreamingImageData (StreamingImageData, frame, image, imageShape, realTimeNs, startTimeNs, stopTimeNs), StreamingMessage (StreamingEndOfSeries, StreamingHeader, StreamingImage), appendix, series, streamingLoop)
+import Simplon.Streaming (StreamingEndOfSeriesData (StreamingEndOfSeriesData), StreamingHeaderData (StreamingHeaderData, config), StreamingImageData (StreamingImageData, frame, image, imageShape, realTimeNs, startTimeNs, stopTimeNs), StreamingMessage (StreamingEndOfSeries, StreamingHeader, StreamingImage), appendix, series, streamingLoop)
 import Simplon.Util (fini, overwriteMVar, packShow, packShowLazy)
 import System.IO (FilePath, IO)
 import System.Log.FastLogger (LogStr, LogType' (LogStdout), ToLogStr (toLogStr), defaultBufSize, newTimeCache, withTimedFastLogger)
-import Text.Show (Show)
 import Web.Scotty (ActionM, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
 import Prelude (Float, Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
-
-data EigerParameterValue
-  = EigerValueFloat !Float
-  | EigerValueBool !Bool
-  | EigerValueText !Text
-  | EigerValueInt !Int
-  deriving (Show)
-
-eigerParameterValueText :: EigerParameterValue -> Maybe Text
-eigerParameterValueText (EigerValueText t) = Just t
-eigerParameterValueText _ = Nothing
-
-instance ToJSON EigerParameterValue where
-  toJSON (EigerValueFloat f) = toJSON f
-  toJSON (EigerValueBool f) = toJSON f
-  toJSON (EigerValueText f) = toJSON f
-  toJSON (EigerValueInt f) = toJSON f
 
 data FloatOrInt = IsFloat !Float | IsInt !Int
 
@@ -91,6 +75,27 @@ data EigerParameter a = EigerParameter
     unit :: !(Maybe Text),
     allowedValues :: ![Text]
   }
+
+-- This is to work around a problem with:
+--
+-- resolvedParameter = eigerParameter' {value = resolvedValue}
+-- which gives:
+--
+--     The record update eigerParameter'
+--                        {value = resolvedValue} with type EigerParameter is ambiguous.
+--    This will not be supported by -XDuplicateRecordFields in future releases of GHC.
+
+setParameterValue :: EigerParameter a -> b -> EigerParameter b
+setParameterValue p v =
+  EigerParameter
+    { value = v,
+      valueType = p.valueType,
+      accessMode = p.accessMode,
+      minValue = p.minValue,
+      maxValue = p.maxValue,
+      unit = p.unit,
+      allowedValues = p.allowedValues
+    }
 
 type MVarEigerParameter = EigerParameter (MVar EigerParameterValue)
 
@@ -490,6 +495,12 @@ waitForArmLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerCon
                         ( StreamingHeader
                             ( StreamingHeaderData
                                 { series = seriesId,
+                                  -- TODO Only "Just" this if we have header detail not equal to "none"
+                                  config =
+                                    Just
+                                      [ EigerParameterNameValue {name = "ntrigger", value = ntrigger},
+                                        EigerParameterNameValue {name = "nimages", value = nimages}
+                                      ],
                                   appendix = eigerParameterValueText headerAppendix
                                 }
                             )
@@ -634,12 +645,12 @@ main = do
           configOrStatus <- pathParam "configOrStatus"
           case Map.lookup (subsystem, configOrStatus) mvarMap of
             Nothing -> status status404
-            Just parameterMap -> do
-              parameter <- pathParam "parameter"
+            Just (parameterMap :: Map.Map Text MVarEigerParameter) -> do
+              parameter :: Text <- pathParam "parameter"
               case Map.lookup parameter parameterMap of
                 Nothing -> status status404
-                Just eigerParameter' -> do
-                  resolvedValue <- liftIO $ readMVar eigerParameter'.value
+                Just (eigerParameter' :: EigerParameter (MVar EigerParameterValue)) -> do
+                  resolvedValue :: EigerParameterValue <- liftIO $ readMVar eigerParameter'.value
                   let resolvedParameter :: EigerParameter EigerParameterValue
-                      resolvedParameter = eigerParameter' {value = resolvedValue}
+                      resolvedParameter = setParameterValue eigerParameter' resolvedValue
                   json resolvedParameter
