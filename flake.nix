@@ -2,7 +2,7 @@
   description = "simplon-stub-hs";
 
   inputs = {
-    nixpkgs.url = "nixpkgs/nixos-24.11";
+    nixpkgs.url = "nixpkgs/nixos-25.11";
   };
 
   outputs = { self, nixpkgs }:
@@ -46,6 +46,12 @@
         nativeBuildInputs = [ cmake ];
         buildInputs = [ hdf5-threadsafe lz4 bzip2 ];
 
+        postPatch = ''
+          substituteInPlace CMakeLists.txt \
+            --replace-fail "cmake_minimum_required(VERSION 3.0.0)" \
+                           "cmake_minimum_required(VERSION 3.10)"
+        '';
+
         cmakeFlags = [
           "-DENABLE_BITSHUFFLE_PLUGIN=yes"
           "-DENABLE_LZ4_PLUGIN=yes"
@@ -61,7 +67,6 @@
           {
             # inherit (top-level-pkgs) hdf5;
             hdf5 = top-level-pkgs.hdf5-threadsafe;
-            scotty = haskellPackages.scotty_0_22;
           };
 
       devShells.${system}.default =
@@ -72,7 +77,6 @@
               cabal-install
               ghcid
               haskellPackages.hlint
-              haskellPackages.apply-refact
               pkg-config
               hdf5-threadsafe
             ];
