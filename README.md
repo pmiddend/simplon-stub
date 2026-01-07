@@ -13,3 +13,5 @@ simplon-stub --input-h5-file ~/some-file.nx5 --zmq-bind-address tcp://*:9999
 ```
 
 It will then listen on port 8080 for HTTP requests, and 9999 for ZMQ connections.
+
+*Note*: If you're trying to use HDF5 files written by, for example, Eiger detectors, you will need to have the "bitshuffle" HDF5 plugin in your `HDF5_PLUGIN_PATH`. The executable created via `nix build` will already include this, but your manual `cabal` call might not.

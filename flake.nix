@@ -63,11 +63,18 @@
     in
     {
       packages.${system}.default =
-        haskellPackages.callCabal2nix packageName self
-          {
-            # inherit (top-level-pkgs) hdf5;
-            hdf5 = top-level-pkgs.hdf5-threadsafe;
-          };
+        let
+          basePackage = haskellPackages.callCabal2nix packageName self
+            {
+              hdf5 = top-level-pkgs.hdf5-threadsafe;
+            };
+        in
+        basePackage.overrideAttrs (oldAttrs: oldAttrs // {
+          nativeBuildInputs = oldAttrs.nativeBuildInputs ++ [ top-level-pkgs.makeWrapper ];
+          postInstall = ''
+            wrapProgram $out/bin/simplon-stub --set HDF5_PLUGIN_PATH "${hdf5-external-filter-plugins}/lib/plugins"
+          '';
+        });
 
       devShells.${system}.default =
         top-level-pkgs.mkShell {
