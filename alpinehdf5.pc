@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+includedir=${prefix}/include
+libdir=${exec_prefix}/lib
+
+Name: alpinehdf5
+Description: Special pkgconfig file for Alpine builds (not sure why it's needed, it just is)
+Version: 1.0.0
+Libs: -lsz -lhdf5
+Libs.private: -lsz -lhdf5

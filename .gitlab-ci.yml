@@ -2,3 +2,6 @@ build-on-alpine:
   image: alpine:3.22
   script:
     - ./ci/build-on-alpine.sh
+  artifacts:
+    paths:
+      - simplon-stub
