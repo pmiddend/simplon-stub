@@ -6,6 +6,7 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_GHC -Wno-missing-role-annotations #-}
 
 module Main (main) where
 
@@ -14,6 +15,7 @@ import Control.Concurrent (Chan, forkIO, newChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Concurrent.STM (atomically, registerDelay)
 import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar)
+import Control.Exception (IOException, catch)
 import Control.Monad (forever, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
@@ -50,7 +52,7 @@ import Simplon.Util (fini, overwriteMVar, packShow, packShowLazy)
 import System.IO (FilePath, IO)
 import System.Log.FastLogger (LogStr, LogType' (LogStdout), ToLogStr (toLogStr), defaultBufSize, newTimeCache, withTimedFastLogger)
 import Web.Scotty (ActionM, get, json, jsonData, middleware, pathParam, put, scotty, status, text)
-import Prelude (Float, Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
+import Prelude (Float, Monoid (mempty), Num ((*), (+), (-)), Ord ((<=)), RealFrac (round), error, realToFrac)
 
 data FloatOrInt = IsFloat !Float | IsInt !Int
 
@@ -340,31 +342,50 @@ waitForImageLoop loopData@(LoopConstantData {loopDataLog, loopSignal, loopEigerC
             imageHeight = dimensions !! 2
             currentFrame = determineCurrentFrame tais
         loopDataLog $ "current frame: " <> packShow currentFrame <> " opening and sending"
-        withImage
-          hdf5State'.hdf5DataSet
-          -- hyperslab offset
-          [currentFrame, 0, 0]
-          -- count: size of one image
-          [1, imageWidth, imageHeight]
-          -- buffer size
-          [imageWidth, imageHeight]
-          \image -> do
-            loopDataLog $ "read image: " <> packShow (BS.length image) <> " bytes"
-            writeChan
-              streamingConfig'.streamingChan
-              ( StreamingImage
-                  ( StreamingImageData
-                      { image = image,
-                        imageShape = [imageWidth, imageHeight],
-                        series = imageSeriesId,
-                        frame = currentFrame,
-                        startTimeNs = 0,
-                        stopTimeNs = 0,
-                        realTimeNs = 0,
-                        appendix = eigerParameterValueText imageAppendix
-                      }
+        let tryWriteChan = withImage
+              hdf5State'.hdf5DataSet
+              -- hyperslab offset
+              [currentFrame, 0, 0]
+              -- count: size of one image
+              [1, imageWidth, imageHeight]
+              -- buffer size
+              [imageWidth, imageHeight]
+              \image -> do
+                loopDataLog $ "read image: " <> packShow (BS.length image) <> " bytes"
+                writeChan
+                  streamingConfig'.streamingChan
+                  ( StreamingImage
+                      ( StreamingImageData
+                          { image = image,
+                            imageShape = [imageWidth, imageHeight],
+                            series = imageSeriesId,
+                            frame = currentFrame,
+                            startTimeNs = 0,
+                            stopTimeNs = 0,
+                            realTimeNs = 0,
+                            appendix = eigerParameterValueText imageAppendix
+                          }
+                      )
                   )
-              )
+            recovery :: IOException -> IO ()
+            recovery _ = do
+              loopDataLog "couldn't read file, returning empty image"
+              writeChan
+                streamingConfig'.streamingChan
+                ( StreamingImage
+                    ( StreamingImageData
+                        { image = mempty,
+                          imageShape = [imageWidth, imageHeight],
+                          series = imageSeriesId,
+                          frame = currentFrame,
+                          startTimeNs = 0,
+                          stopTimeNs = 0,
+                          realTimeNs = 0,
+                          appendix = eigerParameterValueText imageAppendix
+                        }
+                    )
+                )
+        tryWriteChan `catch` recovery
 
       if imageNimagesLeft <= 1
         then do
