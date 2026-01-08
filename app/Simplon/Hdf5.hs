@@ -22,12 +22,13 @@ import Data.Semigroup ((<>))
 import Data.Text (Text, unpack)
 import Foreign (sizeOf)
 import Foreign.C.String (withCString)
-import Foreign.C.Types (CFloat, CUShort)
+import Foreign.C.Types (CUShort)
 import Foreign.Marshal (peekArray)
 import Foreign.Marshal.Array (allocaArray, withArray)
 import Foreign.Ptr (castPtr, nullPtr)
-import Simplon.Hdf5Raw (HidT, h5dclose, h5dget_space, h5dopen, h5dread, h5fAccRdOnly, h5fCloseStrong, h5fclose, h5fopen, h5pDefault, h5pFileAccess, h5pclose, h5pcreate, h5pset_fclose_degree, h5sSelectSet, h5sclose, h5screate_simple, h5sget_simple_extent_dims, h5sget_simple_extent_ndims, h5sselect_hyperslab, h5tNativeFloat, h5tNativeUShort)
+import Simplon.Hdf5Raw (HidT, h5dclose, h5dget_space, h5dopen, h5dread, h5fAccRdOnly, h5fCloseStrong, h5fclose, h5fopen, h5pDefault, h5pFileAccess, h5pclose, h5pcreate, h5pset_fclose_degree, h5sSelectSet, h5sclose, h5screate_simple, h5sget_simple_extent_dims, h5sget_simple_extent_ndims, h5sselect_hyperslab, h5tNativeUShort)
 import System.IO (FilePath, IO)
+import System.IO.Error (ioError, userError)
 import Text.Show (Show (show))
 import Prelude (Num ((*)), error, fromIntegral, undefined)
 
@@ -45,12 +46,10 @@ data Hdf5DataSet = Hdf5DataSet
     hdf5DataSpaceId :: Hdf5DataSpaceId
   }
 
-type DataPath = Text
-
 checkError :: (Num a, Show a, Ord a) => IO a -> IO ()
 checkError action = do
   err <- action
-  when (err < 0) $ error $ "error code " <> show err
+  when (err < 0) $ ioError $ userError $ "error code " <> show err
 
 checkInvalidHid :: IO HidT -> IO HidT
 checkInvalidHid action = do
