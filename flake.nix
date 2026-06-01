@@ -2,7 +2,7 @@
   description = "simplon-stub-hs";
 
   inputs = {
-    nixpkgs.url = "nixpkgs/nixos-25.11";
+    nixpkgs.url = "nixpkgs/nixos-26.05";
   };
 
   outputs = { self, nixpkgs }:
